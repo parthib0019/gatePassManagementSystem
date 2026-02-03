@@ -36,6 +36,7 @@ def get_permitted_students():
                         binary_data.extend(struct.pack('<I', card_id))
                         count += 1
                 except ValueError:
+                    print(f"Skipping invalid line: '{line}'")
                     continue # Skip non-integer lines
             
             print(f"Serving {count} permitted IDs to ESP32.")

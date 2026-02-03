@@ -228,13 +228,18 @@ void loop() {
 
     Serial.printf("[Scanner] Card ID: %u\n", cardID);
 
-    // Check List
     bool allowed = false;
-
+    // Explicit Loop as requested
     xSemaphoreTake(listMutex, portMAX_DELAY);
-    // Use linear search (std::find) as requested:
-    allowed = (std::find(permittedStudents.begin(), permittedStudents.end(),
-                         cardID) != permittedStudents.end());
+    Serial.printf("%d",
+                  size_of(permittedStudents)) for (size_t i = 0;
+                                                   i < permittedStudents.size();
+                                                   i++) {
+      if (permittedStudents[i] == cardID) {
+        allowed = true;
+        break;
+      }
+    }
     xSemaphoreGive(listMutex);
 
     if (allowed) {
