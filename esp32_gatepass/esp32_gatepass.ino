@@ -24,7 +24,8 @@
 const char *ssid = "RKMV_CSMA_ELTG";
 const char *password = "MerVer@2.0.3";
 // Replace with your ngrok URL (must be updated every time ngrok restarts)
-String serverUrl = "https://9284120ee26f.ngrok-free.app/permitted_students";
+String serverUrl = "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
+                   "permitted_students";
 
 // Pin Config
 #define LED_GREEN 2
@@ -64,36 +65,45 @@ void syncDataTask(void *parameter) {
       if (httpCode == HTTP_CODE_OK) {
         // Get length
         int len = http.getSize();
-        uint8_t buff[128] = {0};
 
         WiFiClient *stream = http.getStreamPtr();
 
         // Temporary vector to build new list
         std::vector<uint32_t> newList;
 
+        // Buffer for incoming bytes (persist across loop iterations)
+        std::vector<uint8_t> rxBuffer;
+
         // Read bytes
         while (http.connected() && (len > 0 || len == -1)) {
           size_t size = stream->available();
           if (size) {
-            // Read up to 128 bytes (32 integers)
+            uint8_t temp[128];
             int c = stream->readBytes(
-                buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
+                temp, ((size > sizeof(temp)) ? sizeof(temp) : size));
 
-            // We need chunks of 4 bytes
-            // (This simple logic assumes packets arrive aligned or we process
-            // aligned chunks. For robust stream, we should buffer remainders.
-            // Here we assume reasonable chunks esp for small lists)
-            for (int i = 0; i < c; i += 4) {
-              if (i + 3 < c) {
+            if (c > 0) {
+              // Append to buffer
+              rxBuffer.insert(rxBuffer.end(), temp, temp + c);
+
+              // Process complete 4-byte integers
+              size_t processed = 0;
+              while (processed + 4 <= rxBuffer.size()) {
                 uint32_t id;
                 // Little Endian unpack
-                memcpy(&id, &buff[i], 4);
+                memcpy(&id, &rxBuffer[processed], 4);
                 newList.push_back(id);
+                processed += 4;
               }
-            }
 
-            if (len > 0)
-              len -= c;
+              // Remove processed bytes from buffer
+              if (processed > 0) {
+                rxBuffer.erase(rxBuffer.begin(), rxBuffer.begin() + processed);
+              }
+
+              if (len > 0)
+                len -= c;
+            }
           }
           delay(1);
         }
@@ -120,7 +130,7 @@ void syncDataTask(void *parameter) {
     }
 
     // Period: 30 seconds
-    vTaskDelay(30000 / portTICK_PERIOD_MS);
+    vTaskDelay(30 / portTICK_PERIOD_MS);
   }
 }
 
@@ -231,10 +241,8 @@ void loop() {
     bool allowed = false;
     // Explicit Loop as requested
     xSemaphoreTake(listMutex, portMAX_DELAY);
-    Serial.printf("%d",
-                  size_of(permittedStudents)) for (size_t i = 0;
-                                                   i < permittedStudents.size();
-                                                   i++) {
+    Serial.printf("Checking against %d IDs\n", permittedStudents.size());
+    for (size_t i = 0; i < permittedStudents.size(); i++) {
       if (permittedStudents[i] == cardID) {
         allowed = true;
         break;
