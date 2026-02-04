@@ -1,8 +1,15 @@
 /*
- * ESP32 Dual-Core Gatepass System
+ * ESP32 Dual-Core Gatepass System V2
  *
  * Core 0: Background Sync (WiFi -> Server -> Update RAM Permitted List)
- * Core 1: Real-time Scanning (RFID -> Check List -> Blink LED)
+ * Core 1: Real-time Scanning (RFID -> Check Time Rules -> Check List -> Blink
+ * LED)
+ *
+ * Features:
+ * - NTP Time Sync
+ * - SQLite-backed Binary Protocol
+ * - Global Restricted Periods
+ * - Individual Student Time Slots
  *
  * Hardware Config:
  * - Green LED: D2
@@ -16,6 +23,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <algorithm>
+#include <time.h>
 #include <vector>
 
 // --------------------------------------------------------------------------
@@ -23,6 +31,10 @@
 // --------------------------------------------------------------------------
 const char *ssid = "RKMV_CSMA_ELTG";
 const char *password = "MerVer@2.0.3";
+const char *ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 19800; // UTC +5:30 (India Standard Time)
+const int daylightOffset_sec = 0;
+
 // Replace with your ngrok URL (must be updated every time ngrok restarts)
 String serverUrl = "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
                    "permitted_students";
@@ -36,9 +48,21 @@ String serverUrl = "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
 #define PN532_SS 5
 
 // --------------------------------------------------------------------------
+// DATA STRUCTURES
+// --------------------------------------------------------------------------
+struct StudentPerm {
+  uint32_t uid;
+  uint32_t start; // Unix Timestamp
+  uint32_t end;   // Unix Timestamp
+};
+
+// --------------------------------------------------------------------------
 // GLOBAL VARIABLES (Shared Resources)
 // --------------------------------------------------------------------------
-std::vector<uint32_t> permittedStudents;
+std::vector<StudentPerm> permittedStudents;
+time_t globalRestrictedStart = 0;
+time_t globalRestrictedEnd = 0;
+
 SemaphoreHandle_t listMutex;
 
 // NFC Objects
@@ -54,51 +78,63 @@ const int COOLDOWN_MS = 2000;
 void syncDataTask(void *parameter) {
   while (1) {
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("[Sync] Fetching permitted list...");
-
+      // Create a local buffer to process incoming data
       HTTPClient http;
       http.begin(serverUrl);
-
-      // We expect binary stream
       int httpCode = http.GET();
 
       if (httpCode == HTTP_CODE_OK) {
-        // Get length
         int len = http.getSize();
-
         WiFiClient *stream = http.getStreamPtr();
 
-        // Temporary vector to build new list
-        std::vector<uint32_t> newList;
-
-        // Buffer for incoming bytes (persist across loop iterations)
         std::vector<uint8_t> rxBuffer;
 
-        // Read bytes
+        // Temp storage for parsing
+        uint32_t tempGlobalStart = 0;
+        uint32_t tempGlobalEnd = 0;
+        uint32_t tempCount = 0;
+        bool headerParsed = false;
+
+        std::vector<StudentPerm> newList;
+
+        // Read loop
         while (http.connected() && (len > 0 || len == -1)) {
           size_t size = stream->available();
           if (size) {
-            uint8_t temp[128];
+            uint8_t chunk[128];
             int c = stream->readBytes(
-                temp, ((size > sizeof(temp)) ? sizeof(temp) : size));
+                chunk, ((size > sizeof(chunk)) ? sizeof(chunk) : size));
 
             if (c > 0) {
-              // Append to buffer
-              rxBuffer.insert(rxBuffer.end(), temp, temp + c);
+              rxBuffer.insert(rxBuffer.end(), chunk, chunk + c);
 
-              // Process complete 4-byte integers
-              size_t processed = 0;
-              while (processed + 4 <= rxBuffer.size()) {
-                uint32_t id;
-                // Little Endian unpack
-                memcpy(&id, &rxBuffer[processed], 4);
-                newList.push_back(id);
-                processed += 4;
+              // 1. Try to parse Header (12 bytes)
+              if (!headerParsed && rxBuffer.size() >= 12) {
+                memcpy(&tempGlobalStart, &rxBuffer[0], 4);
+                memcpy(&tempGlobalEnd, &rxBuffer[4], 4);
+                memcpy(&tempCount, &rxBuffer[8], 4);
+
+                rxBuffer.erase(rxBuffer.begin(), rxBuffer.begin() + 12);
+                headerParsed = true;
               }
 
-              // Remove processed bytes from buffer
-              if (processed > 0) {
-                rxBuffer.erase(rxBuffer.begin(), rxBuffer.begin() + processed);
+              // 2. Parse Records (12 bytes each)
+              if (headerParsed) {
+                size_t processed = 0;
+                while (processed + 12 <= rxBuffer.size()) {
+                  StudentPerm p;
+                  memcpy(&p.uid, &rxBuffer[processed], 4);
+                  memcpy(&p.start, &rxBuffer[processed + 4], 4);
+                  memcpy(&p.end, &rxBuffer[processed + 8], 4);
+
+                  newList.push_back(p);
+                  processed += 12;
+                }
+
+                if (processed > 0) {
+                  rxBuffer.erase(rxBuffer.begin(),
+                                 rxBuffer.begin() + processed);
+                }
               }
 
               if (len > 0)
@@ -108,29 +144,26 @@ void syncDataTask(void *parameter) {
           delay(1);
         }
 
-        // Linear search requested, so no need to sort
-        // std::sort(newList.begin(), newList.end());
-
-        // CRITICAL SECTION: Update shared list
+        // Critical Section: Update
         xSemaphoreTake(listMutex, portMAX_DELAY);
         permittedStudents = newList;
+        globalRestrictedStart = tempGlobalStart;
+        globalRestrictedEnd = tempGlobalEnd;
         xSemaphoreGive(listMutex);
 
-        Serial.printf("[Sync] Updated list. Count: %d\n",
-                      permittedStudents.size());
+        Serial.printf("[Sync] Updated. Global: %u-%u, Count: %d\n",
+                      tempGlobalStart, tempGlobalEnd, newList.size());
 
       } else {
         Serial.printf("[Sync] HTTP Error: %d\n", httpCode);
       }
       http.end();
-
     } else {
       Serial.println("[Sync] WiFi not connected");
-      // Try to reconnect? WiFi.begin usually auto-reconnects but we can check
     }
 
     // Period: 30 seconds
-    vTaskDelay(30 / portTICK_PERIOD_MS);
+    vTaskDelay(30000 / portTICK_PERIOD_MS);
   }
 }
 
@@ -139,7 +172,7 @@ void syncDataTask(void *parameter) {
 // --------------------------------------------------------------------------
 void blinkLED(int pin) {
   digitalWrite(pin, HIGH);
-  delay(500); // Blocking delay ok here as this runs on main scanner loop
+  delay(500);
   digitalWrite(pin, LOW);
 }
 
@@ -148,7 +181,6 @@ bool initializeNFC() {
   uint32_t versiondata = nfc.getFirmwareVersion();
   if (!versiondata)
     return false;
-
   nfc.setPassiveActivationRetries(0xFF);
   nfc.SAMConfig();
   return true;
@@ -160,21 +192,16 @@ bool initializeNFC() {
 void setup() {
   Serial.begin(115200);
 
-  // LEDs
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_RED, OUTPUT);
   digitalWrite(LED_GREEN, LOW);
   digitalWrite(LED_RED, LOW);
 
-  // Constants
-  String currentUrl = serverUrl; // Keep a local copy if needed
-
-  // Create Mutex
   listMutex = xSemaphoreCreateMutex();
 
-  Serial.println("--- ESP32 Dual Core Gatepass ---");
+  Serial.println("--- ESP32 Dual Core Gatepass V2 ---");
 
-  // 1. Start WiFi (runs on default event loop, but we monitor in Task 0)
+  // 1. Connect WiFi
   Serial.print("Connecting to WiFi");
   WiFi.begin(ssid, password);
   int i = 0;
@@ -183,25 +210,28 @@ void setup() {
     Serial.print(".");
     i++;
   }
-  Serial.println("\nWiFi Init Done (Connected or Timeout)");
+  Serial.println("\nWiFi Connected");
 
-  // 2. Start Sync Task on Core 0
-  xTaskCreatePinnedToCore(syncDataTask, /* Function */
-                          "SyncTask",   /* Name */
-                          10000,        /* Stack size */
-                          NULL,         /* Parameter */
-                          1,            /* Priority */
-                          NULL,         /* Handle */
-                          0             /* Core ID */
-  );
+  // 2. Init Time (NTP)
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Synchronizing Time...");
+  struct tm timeinfo;
+  while (!getLocalTime(&timeinfo)) {
+    Serial.println(".");
+    delay(500);
+  }
+  Serial.println(&timeinfo, "Time Set: %A, %B %d %Y %H:%M:%S");
 
-  // 3. Setup NFC (Core 1 / Main Loop)
+  // 3. Start Sync Task
+  xTaskCreatePinnedToCore(syncDataTask, "SyncTask", 10000, NULL, 1, NULL, 0);
+
+  // 4. Setup NFC
   SPI.begin(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
   if (initializeNFC()) {
     Serial.println("[NFC] Ready");
     nfcConnected = true;
   } else {
-    Serial.println("[NFC] Not Found (Check Switch/Wires)");
+    Serial.println("[NFC] Not Found");
   }
 }
 
@@ -210,7 +240,6 @@ void setup() {
 // --------------------------------------------------------------------------
 void loop() {
   if (!nfcConnected) {
-    // Retry init occasionally
     delay(5000);
     if (initializeNFC())
       nfcConnected = true;
@@ -220,13 +249,11 @@ void loop() {
   uint8_t uid[7];
   uint8_t uidLength;
 
-  // Scan
   if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 50)) {
     if (millis() - lastCardRead < COOLDOWN_MS)
       return;
     lastCardRead = millis();
 
-    // Calculate ID
     unsigned long cardID = 0;
     if (uidLength == 4) {
       cardID = ((unsigned long)uid[3] << 24) | ((unsigned long)uid[2] << 16) |
@@ -238,19 +265,46 @@ void loop() {
 
     Serial.printf("[Scanner] Card ID: %u\n", cardID);
 
-    bool allowed = false;
-    // Explicit Loop as requested
+    // TIME LOGIC CHECK
+    time_t now = time(nullptr);
+    bool accessGranted = false;
+
     xSemaphoreTake(listMutex, portMAX_DELAY);
-    Serial.printf("Checking against %d IDs\n", permittedStudents.size());
-    for (size_t i = 0; i < permittedStudents.size(); i++) {
-      if (permittedStudents[i] == cardID) {
-        allowed = true;
-        break;
-      }
+
+    // Logic 1: Default Open (Green) if no restricted period
+    if (globalRestrictedStart == 0 && globalRestrictedEnd == 0) {
+      accessGranted = true;
+      Serial.println("Mode: Unrestricted (Open)");
     }
+    // Logic 2: Open if OUTSIDE restricted period
+    else if (now < globalRestrictedStart || now > globalRestrictedEnd) {
+      accessGranted = true;
+      Serial.println("Mode: Outside Restriction (Open)");
+    }
+    // Logic 3: Restricted Period - Check List
+    else {
+      Serial.println("Mode: Restricted (Checking List)");
+      bool found = false;
+      for (const auto &student : permittedStudents) {
+        if (student.uid == cardID) {
+          found = true;
+          // Check Individual Interval
+          if (now >= student.start && now <= student.end) {
+            accessGranted = true;
+            Serial.println("Student Interval: Match");
+          } else {
+            Serial.println("Student Interval: Expired/Future");
+          }
+          break;
+        }
+      }
+      if (!found)
+        Serial.println("ID Not in Permitted List");
+    }
+
     xSemaphoreGive(listMutex);
 
-    if (allowed) {
+    if (accessGranted) {
       Serial.println("[Scanner] ACCESS GRANTED");
       blinkLED(LED_GREEN);
     } else {
@@ -258,6 +312,5 @@ void loop() {
       blinkLED(LED_RED);
     }
   }
-
-  delay(10); // Yield
+  delay(10);
 }
