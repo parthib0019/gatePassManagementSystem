@@ -87,12 +87,20 @@ def submit_permissions():
         if len(parts) >= 3:
             try:
                 rfid = int(parts[0].strip())
-                # specific timestamps assumed to be passed or calculated relative to today
-                # For this implementation, we assume input is Unix Timestamp OR 
-                # we need clarification. User said "INTERVAL_START" 
-                # Let's assume input is Unix Timestamp for simplicity based on plan.
-                start = int(parts[1].strip())
-                end = int(parts[2].strip())
+                
+                # Check if it's integer (Unix Timestamp) or String (Datetime)
+                s_str = parts[1].strip()
+                e_str = parts[2].strip()
+                
+                try:
+                    start = int(s_str)
+                    end = int(e_str)
+                except ValueError:
+                    # Try Parsing Datetime String
+                    fmt = "%Y-%m-%d %H:%M:%S"
+                    start = int(datetime.strptime(s_str, fmt).timestamp())
+                    end = int(datetime.strptime(e_str, fmt).timestamp())
+
                 new_records[rfid] = (start, end)
             except ValueError:
                 continue
@@ -151,9 +159,13 @@ def set_restricted_time():
     """
     Form: 'restricted_time_start', 'restricted_time_ends' (Unix Timestamps)
     """
+    password = request.form.get('password')
+    if password != PASSWORD:
+        return "Unauthorized", 401
+        
     try:
-        start = int(request.form.get('restricted_time_start'))
-        end = int(request.form.get('restricted_time_ends'))
+        start = request.form.get('restricted_time_start')
+        end = request.form.get('restricted_time_ends')
         
         conn = get_db_connection()
         conn.execute('INSERT INTO RESTRICTED_PERIOD (DATE_TIME_OF_START, DATE_TIME_OF_END) VALUES (?, ?)',
@@ -182,9 +194,8 @@ def get_permitted_students():
     # We'll assume the client pushes correct timestamps. We'll fetch the latest one that *overlaps* today?
     # Simpler: Fetch the *last* entry added. 
     
-    global_start = 0
-    global_end = 0
     
+    # Get latest restriction
     # Get latest restriction
     row = conn.execute('SELECT * FROM RESTRICTED_PERIOD ORDER BY ID DESC LIMIT 1').fetchone()
     if row:
@@ -192,8 +203,18 @@ def get_permitted_students():
         # Or just blindly send it and let ESP32 decide?
         # User logic: "send the binary data... and check if there is any restricted time limit"
         # We will send the timestamps.
-        global_start = row['DATE_TIME_OF_START']
-        global_end = row['DATE_TIME_OF_END']
+        # Parse SQLite DATETIME string (YYYY-MM-DD HH:MM:SS) to Unix Timestamp
+        try:
+            # Check if it's already an integer (old data?)
+            global_start = int(row['DATE_TIME_OF_START'])
+            global_end = int(row['DATE_TIME_OF_END'])
+        except ValueError:
+            # Parse string format
+            fmt = "%Y-%m-%d %H:%M:%S"
+            dt_s = datetime.strptime(str(row['DATE_TIME_OF_START']), fmt)
+            dt_e = datetime.strptime(str(row['DATE_TIME_OF_END']), fmt)
+            global_start = int(dt_s.timestamp())
+            global_end = int(dt_e.timestamp())
         
     # 2. Get Permissions for TODAY
     today_str = date.today().isoformat()

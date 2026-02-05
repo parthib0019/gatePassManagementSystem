@@ -163,7 +163,7 @@ void syncDataTask(void *parameter) {
     }
 
     // Period: 30 seconds
-    vTaskDelay(30000 / portTICK_PERIOD_MS);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
@@ -270,6 +270,10 @@ void loop() {
     bool accessGranted = false;
 
     xSemaphoreTake(listMutex, portMAX_DELAY);
+    Serial.printf("[Access] Global: %lu-%lu, now: %lu, Count: %d\n",
+                  (unsigned long)globalRestrictedStart,
+                  (unsigned long)globalRestrictedEnd, (unsigned long)now,
+                  permittedStudents.size());
 
     // Logic 1: Default Open (Green) if no restricted period
     if (globalRestrictedStart == 0 && globalRestrictedEnd == 0) {
@@ -277,7 +281,7 @@ void loop() {
       Serial.println("Mode: Unrestricted (Open)");
     }
     // Logic 2: Open if OUTSIDE restricted period
-    else if (now < globalRestrictedStart || now > globalRestrictedEnd) {
+    else if (now < globalRestrictedStart && now > globalRestrictedEnd) {
       accessGranted = true;
       Serial.println("Mode: Outside Restriction (Open)");
     }
@@ -285,14 +289,21 @@ void loop() {
     else {
       Serial.println("Mode: Restricted (Checking List)");
       bool found = false;
+
       for (const auto &student : permittedStudents) {
         if (student.uid == cardID) {
-          found = true;
+          Serial.printf("Found uid: %lu\n startInterval: %lu, end interval: "
+                        "%lu\n, now: %lu\n",
+                        (unsigned long)student.uid,
+                        (unsigned long)student.start,
+                        (unsigned long)student.end, (unsigned long)now);
           // Check Individual Interval
           if (now >= student.start && now <= student.end) {
+            found = true;
             accessGranted = true;
             Serial.println("Student Interval: Match");
           } else {
+            found = true;
             Serial.println("Student Interval: Expired/Future");
           }
           break;
