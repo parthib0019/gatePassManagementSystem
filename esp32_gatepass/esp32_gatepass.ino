@@ -40,7 +40,7 @@ String serverUrl = "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
                    "permitted_students";
 
 // Pin Config
-#define LED_GREEN 2
+#define LED_GREEN 21
 #define LED_RED 4
 #define PN532_SCK 18
 #define PN532_MISO 19
@@ -211,6 +211,7 @@ void setup() {
     i++;
   }
   Serial.println("\nWiFi Connected");
+  digitalWrite(22, HIGH);
 
   // 2. Init Time (NTP)
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
