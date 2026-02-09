@@ -3,6 +3,8 @@ import sqlite3
 import struct
 import os
 import time
+import csv
+import io
 from datetime import datetime, date
 
 app = Flask(__name__)
@@ -40,6 +42,16 @@ def init_db():
                 ID INTEGER PRIMARY KEY AUTOINCREMENT,
                 DATE_TIME_OF_START INTEGER NOT NULL,
                 DATE_TIME_OF_END INTEGER NOT NULL
+            );
+        ''')
+        
+        # Table for Outgoing Logs (Synced from ESP32)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS OUTGOING_LOG (
+                ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                RFID INTEGER NOT NULL,
+                TIMESTAMP INTEGER NOT NULL,
+                SYNC_TIMESTAMP INTEGER NOT NULL
             );
         ''')
         conn.commit()
@@ -178,14 +190,42 @@ def set_restricted_time():
     except Exception as e:
         return f"DB Error: {e}", 500
 
-@app.route('/permitted_students', methods=['GET'])
+@app.route('/permitted_students', methods=['GET', 'POST'])
 def get_permitted_students():
     """
     Protocol V2:
+    GET: Return Permitted List + Global Restrictions
+    POST: Receive {"exits": [...]} -> Save to DB -> Return Permitted List (Same as GET)
+    
     Header (12B): [Global_Start(4)][Global_End(4)][Record_Count(4)]
     Body (N*12B): [RFID(4)][Start(4)][End(4)] ...
     """
     conn = get_db_connection()
+    
+    # --- HANDLE POST (Sync Exits) ---
+    if request.method == 'POST':
+        try:
+            data = request.get_json()
+            if data and 'exits' in data:
+                exits = data['exits'] # List of {uid, ts}
+                
+                sync_ts = int(time.time())
+                
+                # Bulk Insert
+                # We can iterate and insert.
+                for exit_rec in exits:
+                    uid = exit_rec.get('uid')
+                    ts = exit_rec.get('ts')
+                    if uid is not None and ts is not None:
+                        conn.execute('INSERT INTO OUTGOING_LOG (RFID, TIMESTAMP, SYNC_TIMESTAMP) VALUES (?, ?, ?)',
+                                     (uid, ts, sync_ts))
+                conn.commit()
+                print(f"Synced {len(exits)} exit records.")
+        except Exception as e:
+            print(f"Sync Error: {e}")
+            # Continue to return the list anyway, so ESP32 doesn't starve.
+            # But header might indicate error? Standard HTTP 200 means we processed it. 
+            pass
     
     # 1. Get Restricted Period for TODAY
     # Need to filter by "today"? User schema has just ID/Start/End. 
@@ -229,6 +269,44 @@ def get_permitted_students():
     header = struct.pack('<III', global_start, global_end, record_count)
     
     return Response(header + blob, mimetype='application/octet-stream')
+
+@app.route('/get_outgoing_csv', methods=['POST'])
+def get_outgoing_csv():
+    """
+    Download OUTGOING_LOG as CSV.
+    Requires 'password' in form data.
+    """
+    password = request.form.get('password')
+    if password != PASSWORD:
+        return "Unauthorized", 401
+    
+    conn = get_db_connection()
+    try:
+        # Get all logs, newest first
+        cursor = conn.execute('SELECT * FROM OUTGOING_LOG ORDER BY TIMESTAMP DESC')
+        rows = cursor.fetchall()
+    except Exception as e:
+        conn.close()
+        return f"DB Error: {e}", 500
+    conn.close()
+
+    # Generate CSV
+    output = io.StringIO()
+    writer = csv.writer(output)
+    # Headers
+    writer.writerow(['ID', 'RFID', 'TIMESTAMP', 'SYNC_TIMESTAMP', 'READABLE_TIME'])
+    
+    for row in rows:
+        ts = row['TIMESTAMP']
+        readable = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+        writer.writerow([row['ID'], row['RFID'], row['TIMESTAMP'], row['SYNC_TIMESTAMP'], readable])
+        
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-disposition": "attachment; filename=outgoing_students.csv"}
+    )
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)

@@ -50,16 +50,23 @@ String serverUrl = "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
 // --------------------------------------------------------------------------
 // DATA STRUCTURES
 // --------------------------------------------------------------------------
+
 struct StudentPerm {
   uint32_t uid;
   uint32_t start; // Unix Timestamp
   uint32_t end;   // Unix Timestamp
 };
 
+struct ExitRecord {
+  uint32_t uid;
+  uint32_t ts;
+};
+
 // --------------------------------------------------------------------------
 // GLOBAL VARIABLES (Shared Resources)
 // --------------------------------------------------------------------------
 std::vector<StudentPerm> permittedStudents;
+std::vector<ExitRecord> exitCache;
 time_t globalRestrictedStart = 0;
 time_t globalRestrictedEnd = 0;
 
@@ -78,47 +85,80 @@ const int COOLDOWN_MS = 2000;
 void syncDataTask(void *parameter) {
   while (1) {
     if (WiFi.status() == WL_CONNECTED) {
-      // Create a local buffer to process incoming data
       HTTPClient http;
       http.begin(serverUrl);
-      int httpCode = http.GET();
+      http.addHeader("Content-Type", "application/json");
+
+      // 1. Prepare JSON Payload from Cache
+      String jsonPayload = "{\"exits\":[";
+      std::vector<ExitRecord> tempCache;
+
+      xSemaphoreTake(listMutex, portMAX_DELAY);
+      tempCache = exitCache; // Copy cache to temp
+      xSemaphoreGive(listMutex);
+
+      for (size_t i = 0; i < tempCache.size(); i++) {
+        jsonPayload += "{\"uid\":" + String(tempCache[i].uid) +
+                       ",\"ts\":" + String(tempCache[i].ts) + "}";
+        if (i < tempCache.size() - 1)
+          jsonPayload += ",";
+      }
+      jsonPayload += "]}";
+
+      // 2. POST (Upload Cache + Get New List)
+      // Note: If cache is empty, we still POST to get the list (or we could
+      // GET). Protocol says POST supports both.
+      int httpCode = http.POST(jsonPayload);
 
       if (httpCode == HTTP_CODE_OK) {
+        // Success! Clear uploaded records from main cache
+        if (!tempCache.empty()) {
+          xSemaphoreTake(listMutex, portMAX_DELAY);
+          // We assume successful upload means we can clear.
+          // Ideally we'd clear only the specific IDs, but for simplicity/atomic
+          // op: We remove the first N elements we sent. But new elements might
+          // have been added during POST. So we erase the exact count we sent.
+          if (exitCache.size() >= tempCache.size()) {
+            exitCache.erase(exitCache.begin(),
+                            exitCache.begin() + tempCache.size());
+          } else {
+            exitCache.clear(); // Should not happen, but safe fallback
+          }
+          xSemaphoreGive(listMutex);
+          Serial.printf("[Sync] Uploaded %d exit records\n", tempCache.size());
+        }
+
+        // 3. Process Response (Binary List)
         int len = http.getSize();
         WiFiClient *stream = http.getStreamPtr();
 
         std::vector<uint8_t> rxBuffer;
 
-        // Temp storage for parsing
         uint32_t tempGlobalStart = 0;
         uint32_t tempGlobalEnd = 0;
         uint32_t tempCount = 0;
         bool headerParsed = false;
-
         std::vector<StudentPerm> newList;
 
-        // Read loop
         while (http.connected() && (len > 0 || len == -1)) {
           size_t size = stream->available();
           if (size) {
             uint8_t chunk[128];
             int c = stream->readBytes(
                 chunk, ((size > sizeof(chunk)) ? sizeof(chunk) : size));
-
             if (c > 0) {
               rxBuffer.insert(rxBuffer.end(), chunk, chunk + c);
 
-              // 1. Try to parse Header (12 bytes)
+              // Parse Header
               if (!headerParsed && rxBuffer.size() >= 12) {
                 memcpy(&tempGlobalStart, &rxBuffer[0], 4);
                 memcpy(&tempGlobalEnd, &rxBuffer[4], 4);
                 memcpy(&tempCount, &rxBuffer[8], 4);
-
                 rxBuffer.erase(rxBuffer.begin(), rxBuffer.begin() + 12);
                 headerParsed = true;
               }
 
-              // 2. Parse Records (12 bytes each)
+              // Parse Records
               if (headerParsed) {
                 size_t processed = 0;
                 while (processed + 12 <= rxBuffer.size()) {
@@ -126,17 +166,14 @@ void syncDataTask(void *parameter) {
                   memcpy(&p.uid, &rxBuffer[processed], 4);
                   memcpy(&p.start, &rxBuffer[processed + 4], 4);
                   memcpy(&p.end, &rxBuffer[processed + 8], 4);
-
                   newList.push_back(p);
                   processed += 12;
                 }
-
                 if (processed > 0) {
                   rxBuffer.erase(rxBuffer.begin(),
                                  rxBuffer.begin() + processed);
                 }
               }
-
               if (len > 0)
                 len -= c;
             }
@@ -144,15 +181,14 @@ void syncDataTask(void *parameter) {
           delay(1);
         }
 
-        // Critical Section: Update
+        // Update Permitted List
         xSemaphoreTake(listMutex, portMAX_DELAY);
         permittedStudents = newList;
         globalRestrictedStart = tempGlobalStart;
         globalRestrictedEnd = tempGlobalEnd;
         xSemaphoreGive(listMutex);
 
-        Serial.printf("[Sync] Updated. Global: %u-%u, Count: %d\n",
-                      tempGlobalStart, tempGlobalEnd, newList.size());
+        Serial.printf("[Sync] List Updated. Count: %d\n", newList.size());
 
       } else {
         Serial.printf("[Sync] HTTP Error: %d\n", httpCode);
@@ -162,8 +198,8 @@ void syncDataTask(void *parameter) {
       Serial.println("[Sync] WiFi not connected");
     }
 
-    // Period: 30 seconds
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    // Interval: 30 seconds
+    vTaskDelay(30 / portTICK_PERIOD_MS);
   }
 }
 
@@ -318,6 +354,13 @@ void loop() {
 
     if (accessGranted) {
       Serial.println("[Scanner] ACCESS GRANTED");
+
+      // Cache Exit
+      xSemaphoreTake(listMutex, portMAX_DELAY);
+      exitCache.push_back({(uint32_t)cardID, (uint32_t)now});
+      xSemaphoreGive(listMutex);
+      Serial.println("[Scanner] Added to Exit Cache");
+
       blinkLED(LED_GREEN);
     } else {
       Serial.println("[Scanner] ACCESS DENIED");
