@@ -45,15 +45,18 @@ def init_db():
             );
         ''')
         
-        # Table for Outgoing Logs (Synced from ESP32)
+        # Table for Student Tracking (Entry/Exit)
         conn.execute('''
-            CREATE TABLE IF NOT EXISTS OUTGOING_LOG (
+            CREATE TABLE IF NOT EXISTS Student_tracker (
                 ID INTEGER PRIMARY KEY AUTOINCREMENT,
                 RFID INTEGER NOT NULL,
-                TIMESTAMP INTEGER NOT NULL,
-                SYNC_TIMESTAMP INTEGER NOT NULL
+                STATE INTEGER NOT NULL,
+                DATE_TIME TEXT NOT NULL
             );
         ''')
+        
+        # Drop old table if exists (Migration)
+        conn.execute('DROP TABLE IF EXISTS OUTGOING_LOG')
         conn.commit()
     except Exception as e:
         print(f"DB Init Error: {e}")
@@ -202,29 +205,29 @@ def get_permitted_students():
     """
     conn = get_db_connection()
     
-    # --- HANDLE POST (Sync Exits) ---
+    # --- HANDLE POST (Sync Tracking) ---
     if request.method == 'POST':
         try:
             data = request.get_json()
-            if data and 'exits' in data:
-                exits = data['exits'] # List of {uid, ts}
-                
-                sync_ts = int(time.time())
+            if data and 'tracking' in data:
+                tracks = data['tracking'] # List of {uid, ts, state}
                 
                 # Bulk Insert
-                # We can iterate and insert.
-                for exit_rec in exits:
-                    uid = exit_rec.get('uid')
-                    ts = exit_rec.get('ts')
-                    if uid is not None and ts is not None:
-                        conn.execute('INSERT INTO OUTGOING_LOG (RFID, TIMESTAMP, SYNC_TIMESTAMP) VALUES (?, ?, ?)',
-                                     (uid, ts, sync_ts))
+                for track in tracks:
+                    uid = track.get('uid')
+                    ts = track.get('ts') # Unix Timestamp from ESP32
+                    state = track.get('state')
+                    
+                    if uid is not None and ts is not None and state is not None:
+                        # Convert TS to Readable Date Time
+                        dt_str = datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        conn.execute('INSERT INTO Student_tracker (RFID, STATE, DATE_TIME) VALUES (?, ?, ?)',
+                                     (uid, state, dt_str))
                 conn.commit()
-                print(f"Synced {len(exits)} exit records.")
+                print(f"Synced {len(tracks)} tracking records.")
         except Exception as e:
             print(f"Sync Error: {e}")
-            # Continue to return the list anyway, so ESP32 doesn't starve.
-            # But header might indicate error? Standard HTTP 200 means we processed it. 
             pass
     
     # 1. Get Restricted Period for TODAY
@@ -270,20 +273,25 @@ def get_permitted_students():
     
     return Response(header + blob, mimetype='application/octet-stream')
 
-@app.route('/get_outgoing_csv', methods=['POST'])
-def get_outgoing_csv():
+@app.route('/get_tracker_csv', methods=['POST'])
+def get_tracker_csv():
     """
-    Download OUTGOING_LOG as CSV.
+    Download Student_tracker as CSV.
     Requires 'password' in form data.
+    Optional 'date' (YYYY-MM-DD) to filter.
     """
     password = request.form.get('password')
+    date = request.form.get('date')
     if password != PASSWORD:
         return "Unauthorized", 401
     
     conn = get_db_connection()
     try:
-        # Get all logs, newest first
-        cursor = conn.execute('SELECT * FROM OUTGOING_LOG ORDER BY TIMESTAMP DESC')
+        # Get logs (filter by date if provided)
+        if date:
+            cursor = conn.execute('SELECT * FROM Student_tracker WHERE DATE_TIME LIKE ? ORDER BY ID DESC', (date + '%',))
+        else:
+            cursor = conn.execute('SELECT * FROM Student_tracker ORDER BY ID DESC')
         rows = cursor.fetchall()
     except Exception as e:
         conn.close()
@@ -294,17 +302,15 @@ def get_outgoing_csv():
     output = io.StringIO()
     writer = csv.writer(output)
     # Headers
-    writer.writerow(['ID', 'RFID', 'TIMESTAMP', 'SYNC_TIMESTAMP', 'READABLE_TIME'])
+    writer.writerow(['ID', 'RFID', 'STATE', 'DATE_TIME'])
     
     for row in rows:
-        ts = row['TIMESTAMP']
-        readable = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
-        writer.writerow([row['ID'], row['RFID'], row['TIMESTAMP'], row['SYNC_TIMESTAMP'], readable])
+        writer.writerow([row['ID'], row['RFID'], row['STATE'], row['DATE_TIME']])
         
     return Response(
         output.getvalue(),
         mimetype="text/csv",
-        headers={"Content-disposition": "attachment; filename=outgoing_students.csv"}
+        headers={"Content-disposition": "attachment; filename=student_tracking.csv"}
     )
 
 
