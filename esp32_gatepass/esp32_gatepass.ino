@@ -17,11 +17,11 @@
  * - RFID (PN532): SCK=18, MISO=19, MOSI=23, SS=5 (VSPI)
  */
 
-#include "PN532.h"
+#include <Adafruit_PN532.h>
 #include <HTTPClient.h>
-#include <PN532_SPI.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include <algorithm>
 #include <time.h>
 #include <vector>
@@ -31,7 +31,10 @@
 // --------------------------------------------------------------------------
 const char *ssid = "RKMV_CSMA_ELTG";
 const char *password = "MerVer@2.0.3";
-const char *ntpServer = "pool.ntp.org";
+// Use multiple, faster NTP servers for better reliability
+const char *ntpServer1 = "time.google.com";
+const char *ntpServer2 = "pool.ntp.org";
+const char *ntpServer3 = "time.nist.gov";
 const long gmtOffset_sec = 19800; // UTC +5:30 (India Standard Time)
 const int daylightOffset_sec = 0;
 
@@ -40,13 +43,14 @@ String serverUrl = "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
                    "permitted_students";
 
 // Pin Config
-#define LED_GREEN 21
+#define LED_GREEN 13
 #define LED_RED 4
 #define PN532_SCK 18
 #define PN532_MISO 19
 #define PN532_MOSI 23
 #define PN532_SS_1 5
 #define PN532_SS_2 22
+#define buzzer 12
 
 // --------------------------------------------------------------------------
 // DATA STRUCTURES
@@ -75,10 +79,9 @@ time_t globalRestrictedEnd = 0;
 SemaphoreHandle_t listMutex;
 
 // NFC Objects
-PN532_SPI pn532spi1(SPI, PN532_SS_1);
-PN532_SPI pn532spi2(SPI, PN532_SS_2);
-PN532 nfc1(pn532spi1);
-PN532 nfc2(pn532spi2);
+// Using Hardware SPI (Default VSPI pins: 18, 19, 23)
+Adafruit_PN532 nfc1(PN532_SS_1);
+Adafruit_PN532 nfc2(PN532_SS_2);
 bool nfc1Connected = false;
 bool nfc2Connected = false;
 unsigned long lastCardRead = 0;
@@ -206,13 +209,46 @@ void syncDataTask(void *parameter) {
 // --------------------------------------------------------------------------
 // HELPER FUNCTIONS
 // --------------------------------------------------------------------------
-void blinkLED(int pin) {
-  digitalWrite(pin, HIGH);
-  delay(500);
-  digitalWrite(pin, LOW);
+void playTone(int count, int onDuration, int offDuration) {
+  for (int i = 0; i < count; i++) {
+    digitalWrite(buzzer, HIGH);
+    delay(onDuration);
+    digitalWrite(buzzer, LOW);
+    if (i < count - 1)
+      delay(offDuration);
+  }
 }
 
-bool initializeNFC(PN532 &nfc_obj) {
+void signalGranted() {
+  // Green LED + 1 Beep
+  digitalWrite(LED_GREEN, HIGH);
+  playTone(1, 200, 0);
+  delay(1000); // Keep LED on for a bit
+  digitalWrite(LED_GREEN, LOW);
+}
+
+void signalDenied() {
+  // Red LED + 3 Fast Beeps
+  digitalWrite(LED_RED, HIGH);
+  playTone(5, 100, 100);
+  delay(500);
+  digitalWrite(LED_RED, LOW);
+}
+
+void blinkLED(int pin) {
+  // Deprecated, keeping for compatibility if needed, but logic moved to signals
+  if (pin == LED_GREEN)
+    signalGranted();
+  else if (pin == LED_RED)
+    signalDenied();
+  else {
+    digitalWrite(pin, HIGH);
+    delay(500);
+    digitalWrite(pin, LOW);
+  }
+}
+
+bool initializeNFC(Adafruit_PN532 &nfc_obj) {
   nfc_obj.begin();
   uint32_t versiondata = nfc_obj.getFirmwareVersion();
   if (!versiondata)
@@ -230,8 +266,13 @@ void setup() {
 
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_RED, OUTPUT);
+  pinMode(buzzer, OUTPUT);
   digitalWrite(LED_GREEN, LOW);
   digitalWrite(LED_RED, LOW);
+  digitalWrite(buzzer, LOW);
+
+  // Startup Sound
+  playTone(1, 100, 0);
 
   listMutex = xSemaphoreCreateMutex();
 
@@ -247,15 +288,20 @@ void setup() {
     i++;
   }
   Serial.println("\nWiFi Connected");
-  digitalWrite(22, HIGH);
+  // WiFi Connected Sound: 1s wait, then 2 beeps
+  delay(1000);
+  playTone(2, 200, 100);
 
   // 2. Init Time (NTP)
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  Serial.println("Synchronizing Time...");
+  // configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2,
+  // ntpServer3); Note: Standard ESP32 configTime takes up to 3 servers.
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2,
+             ntpServer3);
+  Serial.println("Synchronizing Time (Google/Pool/NIST)...");
   struct tm timeinfo;
   while (!getLocalTime(&timeinfo)) {
     Serial.println(".");
-    delay(500);
+    delay(10);
   }
   Serial.println(&timeinfo, "Time Set: %A, %B %d %Y %H:%M:%S");
 
@@ -263,7 +309,15 @@ void setup() {
   xTaskCreatePinnedToCore(syncDataTask, "SyncTask", 10000, NULL, 1, NULL, 0);
 
   // 4. Setup NFC
-  SPI.begin(PN532_SCK, PN532_MISO, PN532_MOSI, 5); // Default SS
+  // manually set SS to HIGH to deselect
+  pinMode(PN532_SS_1, OUTPUT);
+  pinMode(PN532_SS_2, OUTPUT);
+  digitalWrite(PN532_SS_1, HIGH);
+  digitalWrite(PN532_SS_2, HIGH);
+
+  SPI.begin(PN532_SCK, PN532_MISO, PN532_MOSI,
+            -1); // -1 to disable default SS handling
+  delay(100);
 
   Serial.print("[Setup] Init Reader 1 (EXIT)... ");
   if (initializeNFC(nfc1)) {
@@ -272,6 +326,7 @@ void setup() {
   } else {
     Serial.println("FAILED");
   }
+  delay(100);
 
   Serial.print("[Setup] Init Reader 2 (ENTRY)... ");
   if (initializeNFC(nfc2)) {
@@ -280,6 +335,7 @@ void setup() {
   } else {
     Serial.println("FAILED");
   }
+  playTone(3, 100, 100);
 }
 
 // --------------------------------------------------------------------------
@@ -354,10 +410,10 @@ void loop() {
           xSemaphoreTake(listMutex, portMAX_DELAY);
           trackCache.push_back({(uint32_t)cardID, (uint32_t)now, 0});
           xSemaphoreGive(listMutex);
-          blinkLED(LED_GREEN);
+          signalGranted();
         } else {
           Serial.println("[Scanner 1] ACCESS DENIED");
-          blinkLED(LED_RED);
+          signalDenied();
         }
       }
     }
@@ -389,7 +445,7 @@ void loop() {
         xSemaphoreGive(listMutex);
 
         Serial.println("[Scanner 2] Entry Logged");
-        blinkLED(LED_GREEN);
+        signalGranted();
       }
     }
   }
