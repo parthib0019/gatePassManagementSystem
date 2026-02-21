@@ -41,6 +41,9 @@ const int daylightOffset_sec = 0;
 // Replace with your ngrok URL (must be updated every time ngrok restarts)
 String serverUrl = "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
                    "permitted_students";
+String timeServerUrl =
+    "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
+    "current_time";
 
 // Pin Config
 #define LED_GREEN 13
@@ -258,6 +261,41 @@ bool initializeNFC(Adafruit_PN532 &nfc_obj) {
   return true;
 }
 
+void syncTimeWithServer() {
+  Serial.println("Synchronizing Time with Server...");
+  HTTPClient http;
+  http.begin(timeServerUrl);
+  int httpCode = http.GET();
+
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    long ts = payload.toInt();
+    if (ts > 1000000) { // Valid timestamp check
+      struct timeval tv;
+      tv.tv_sec =
+          ts +
+          19800; // Add GMT Offset (19800s = 5h 30m) manually if raw TS is UTC
+      // Wait, server returns UTC timestamp? user said "actual time count by the
+      // sever". Usually time.time() in Python is UTC. settimeofday expects UTC.
+      // But we have localized logic elsewhere?
+      // Let's assume server sends UTC and we set UTC, then local time handling
+      // works via timezone. Python time.time() is UTC.
+      tv.tv_sec = ts;
+      tv.tv_usec = 0;
+      settimeofday(&tv, NULL);
+
+      // Apply Timezone for local print
+      setenv("TZ", "IST-5:30", 1);
+      tzset();
+
+      Serial.printf("Time synced: %ld\n", ts);
+    }
+  } else {
+    Serial.printf("Time Sync Failed. HTTP: %d\n", httpCode);
+  }
+  http.end();
+}
+
 // --------------------------------------------------------------------------
 // SETUP
 // --------------------------------------------------------------------------
@@ -292,18 +330,18 @@ void setup() {
   delay(1000);
   playTone(2, 200, 100);
 
-  // 2. Init Time (NTP)
+  // 2. Init Time (Server)
   // configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2,
-  // ntpServer3); Note: Standard ESP32 configTime takes up to 3 servers.
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2,
-             ntpServer3);
-  Serial.println("Synchronizing Time (Google/Pool/NIST)...");
+  //            ntpServer3);
+  // Serial.println("Synchronizing Time (Google/Pool/NIST)...");
+  syncTimeWithServer();
+
   struct tm timeinfo;
-  while (!getLocalTime(&timeinfo)) {
-    Serial.println(".");
-    delay(10);
+  if (getLocalTime(&timeinfo)) {
+    Serial.println(&timeinfo, "Time Set: %A, %B %d %Y %H:%M:%S");
+  } else {
+    Serial.println("Failed to obtain time");
   }
-  Serial.println(&timeinfo, "Time Set: %A, %B %d %Y %H:%M:%S");
 
   // 3. Start Sync Task
   xTaskCreatePinnedToCore(syncDataTask, "SyncTask", 10000, NULL, 1, NULL, 0);

@@ -70,6 +70,11 @@ init_db()
 def home():
     return "GatePass Server V2 Running"
 
+@app.route('/current_time', methods=['GET'])
+def current_time():
+    """Returns current server time as Unix timestamp"""
+    return str(int(time.time()))
+
 @app.route('/PermitedPDFSubmission', methods=['POST'])
 def submit_permissions():
     """
