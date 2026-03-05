@@ -2,7 +2,7 @@
 
 #starting the virtual environment
 
-/workspace/Workspace/Workspace/MY_projects/gatePassManagementSystem/venv/bin/python serverFiles/server.py >> server.log 2>&1 &
+PYTHONUNBUFFERED=1 /workspace/Workspace/Workspace/MY_projects/gatePassManagementSystem/venv/bin/gunicorn serverFiles.server:app --bind 127.0.0.1:5000 --workers 4  >> server.log 2>&1 &
 
 #inicializing ngrok
 echo "$(date): Starting Ngrok..." >> ngrok.log

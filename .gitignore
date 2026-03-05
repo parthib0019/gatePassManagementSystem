@@ -6,3 +6,4 @@ ngrok.log
 filteredkey.csv
 BUSINESS_RESOURCES.md
 COMPONENTS.md
+serverFiles/__pycache__

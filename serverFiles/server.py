@@ -75,6 +75,47 @@ def current_time():
     """Returns current server time as Unix timestamp"""
     return str(int(time.time()))
 
+@app.route('/todayList', methods=['GET'])
+def today_list():
+    """
+    Fetch today's permitted student list from the binary blob,
+    convert to CSV, and send as a download.
+    """
+    today_str = date.today().isoformat()  # YYYY-MM-DD
+    
+    conn = get_db_connection()
+    try:
+        row = conn.execute('SELECT PERMISSIONS FROM PERMISSION_LIST WHERE DATE_TIME = ?', (today_str,)).fetchone()
+    except Exception as e:
+        conn.close()
+        return f"DB Error: {e}", 500
+    conn.close()
+    
+    if not row or not row['PERMISSIONS']:
+        return "No permissions found for today", 404
+    
+    blob = row['PERMISSIONS']
+    
+    # Parse binary: [RFID(4)][START(4)][END(4)] per record, little-endian
+    chunk_size = 12
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['RFID', 'INTERVAL_START', 'INTERVAL_END', 'START_READABLE', 'END_READABLE'])
+    
+    for i in range(0, len(blob), chunk_size):
+        chunk = blob[i:i+chunk_size]
+        if len(chunk) == chunk_size:
+            rfid, start_ts, end_ts = struct.unpack('<III', chunk)
+            start_str = datetime.fromtimestamp(start_ts).strftime('%Y-%m-%d %H:%M:%S')
+            end_str = datetime.fromtimestamp(end_ts).strftime('%Y-%m-%d %H:%M:%S')
+            writer.writerow([rfid, start_ts, end_ts, start_str, end_str])
+    
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-disposition": f"attachment; filename=permitted_students_{today_str}.csv"}
+    )
+
 @app.route('/PermitedPDFSubmission', methods=['POST'])
 def submit_permissions():
     """
@@ -320,4 +361,4 @@ def get_tracker_csv():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='127.0.0.1', port=5000)

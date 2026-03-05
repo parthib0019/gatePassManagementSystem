@@ -16,11 +16,11 @@
  * - Red LED:   D4
  * - RFID (PN532): SCK=18, MISO=19, MOSI=23, SS=5 (VSPI)
  */
-
 #include <Adafruit_PN532.h>
 #include <HTTPClient.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <algorithm>
 #include <time.h>
@@ -31,10 +31,7 @@
 // --------------------------------------------------------------------------
 const char *ssid = "RKMV_CSMA_ELTG";
 const char *password = "MerVer@2.0.3";
-// Use multiple, faster NTP servers for better reliability
-const char *ntpServer1 = "time.google.com";
-const char *ntpServer2 = "pool.ntp.org";
-const char *ntpServer3 = "time.nist.gov";
+//time delta
 const long gmtOffset_sec = 19800; // UTC +5:30 (India Standard Time)
 const int daylightOffset_sec = 0;
 
@@ -96,8 +93,10 @@ const int COOLDOWN_MS = 2000;
 void syncDataTask(void *parameter) {
   while (1) {
     if (WiFi.status() == WL_CONNECTED) {
+      WiFiClientSecure client;
+      client.setInsecure(); // Skip SSL cert verification (OK for ngrok)
       HTTPClient http;
-      http.begin(serverUrl);
+      http.begin(client, serverUrl);
       http.addHeader("Content-Type", "application/json");
 
       // 1. Prepare JSON Payload from Cache
@@ -263,8 +262,10 @@ bool initializeNFC(Adafruit_PN532 &nfc_obj) {
 
 void syncTimeWithServer() {
   Serial.println("Synchronizing Time with Server...");
+  WiFiClientSecure client;
+  client.setInsecure(); // Skip SSL cert verification
   HTTPClient http;
-  http.begin(timeServerUrl);
+  http.begin(client, timeServerUrl);
   int httpCode = http.GET();
 
   if (httpCode == HTTP_CODE_OK) {
@@ -405,10 +406,6 @@ void loop() {
         // --- EXIT PERMISSION CHECK ---
         bool accessGranted = false;
         xSemaphoreTake(listMutex, portMAX_DELAY);
-        Serial.printf("global restricted start: %d\n", globalRestrictedStart);
-        Serial.printf("global restricted end: %d\n", globalRestrictedEnd);
-
-        Serial.printf("current time %d\n", now);
 
         // Logic 1: Default Open (Green) if no restricted period
         if (globalRestrictedStart == 0 && globalRestrictedEnd == 0) {
