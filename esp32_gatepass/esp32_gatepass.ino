@@ -36,11 +36,9 @@ const long gmtOffset_sec = 19800; // UTC +5:30 (India Standard Time)
 const int daylightOffset_sec = 0;
 
 // Replace with your ngrok URL (must be updated every time ngrok restarts)
-String serverUrl = "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
+String serverUrl = "http://148.230.67.153:5500/"
                    "permitted_students";
-String timeServerUrl =
-    "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
-    "current_time";
+String timeServerUrl ="http://148.230.67.153:5500/current_time";
 
 // Pin Config
 #define LED_GREEN 13
@@ -93,10 +91,16 @@ const int COOLDOWN_MS = 2000;
 void syncDataTask(void *parameter) {
   while (1) {
     if (WiFi.status() == WL_CONNECTED) {
-      WiFiClientSecure client;
-      client.setInsecure(); // Skip SSL cert verification (OK for ngrok)
+      WiFiClient *client = nullptr;
+      if (serverUrl.startsWith("https://")) {
+        WiFiClientSecure *secClient = new WiFiClientSecure();
+        secClient->setInsecure(); // Skip SSL cert verification (OK for ngrok)
+        client = secClient;
+      } else {
+        client = new WiFiClient();
+      }
       HTTPClient http;
-      http.begin(client, serverUrl);
+      http.begin(*client, serverUrl);
       http.addHeader("Content-Type", "application/json");
 
       // 1. Prepare JSON Payload from Cache
@@ -199,6 +203,7 @@ void syncDataTask(void *parameter) {
         Serial.printf("[Sync] HTTP Error: %d\n", httpCode);
       }
       http.end();
+      delete client;
     } else {
       Serial.println("[Sync] WiFi not connected");
     }
@@ -262,10 +267,16 @@ bool initializeNFC(Adafruit_PN532 &nfc_obj) {
 
 void syncTimeWithServer() {
   Serial.println("Synchronizing Time with Server...");
-  WiFiClientSecure client;
-  client.setInsecure(); // Skip SSL cert verification
+  WiFiClient *client = nullptr;
+  if (timeServerUrl.startsWith("https://")) {
+    WiFiClientSecure *secClient = new WiFiClientSecure();
+    secClient->setInsecure(); // Skip SSL cert verification
+    client = secClient;
+  } else {
+    client = new WiFiClient();
+  }
   HTTPClient http;
-  http.begin(client, timeServerUrl);
+  http.begin(*client, timeServerUrl);
   int httpCode = http.GET();
 
   if (httpCode == HTTP_CODE_OK) {
@@ -295,6 +306,7 @@ void syncTimeWithServer() {
     Serial.printf("Time Sync Failed. HTTP: %d\n", httpCode);
   }
   http.end();
+  delete client;
 }
 
 // --------------------------------------------------------------------------
