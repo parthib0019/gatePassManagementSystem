@@ -21,6 +21,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WebSocketsClient.h>
 #include <Wire.h>
 #include <algorithm>
 #include <time.h>
@@ -36,9 +37,15 @@ const long gmtOffset_sec = 19800; // UTC +5:30 (India Standard Time)
 const int daylightOffset_sec = 0;
 
 // Replace with your ngrok URL (must be updated every time ngrok restarts)
-String serverUrl = "http://148.230.67.153:5500/"
+String serverUrl = "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
                    "permitted_students";
-String timeServerUrl ="http://148.230.67.153:5500/current_time";
+String timeServerUrl ="https://nonmetalliferous-callen-anciently.ngrok-free.dev/current_time";
+
+String wsHost = "nonmetalliferous-callen-anciently.ngrok-free.dev";
+int wsPort = 443;
+String wsPath = "/ws";
+
+WebSocketsClient webSocket;
 
 // Pin Config
 #define LED_GREEN 13
@@ -86,130 +93,103 @@ unsigned long lastCardRead = 0;
 const int COOLDOWN_MS = 2000;
 
 // --------------------------------------------------------------------------
+// WEBSOCKET HANDLER
+// --------------------------------------------------------------------------
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[WSc] Disconnected!\n");
+      break;
+    case WStype_CONNECTED:
+      Serial.printf("[WSc] Connected to url: %s\n", payload);
+      break;
+    case WStype_TEXT:
+      Serial.printf("[WSc] get text: %s\n", payload);
+      break;
+    case WStype_BIN:
+      Serial.printf("[WSc] get binary length: %u\n", length);
+      if (length >= 12) {
+          uint32_t tempGlobalStart = 0;
+          uint32_t tempGlobalEnd = 0;
+          uint32_t recordCount = 0;
+          
+          memcpy(&tempGlobalStart, &payload[0], 4);
+          memcpy(&tempGlobalEnd, &payload[4], 4);
+          memcpy(&recordCount, &payload[8], 4);
+          
+          std::vector<StudentPerm> newList;
+          size_t processed = 12;
+          while (processed + 12 <= length) {
+              StudentPerm p;
+              memcpy(&p.uid, &payload[processed], 4);
+              memcpy(&p.start, &payload[processed + 4], 4);
+              memcpy(&p.end, &payload[processed + 8], 4);
+              newList.push_back(p);
+              processed += 12;
+          }
+          
+          xSemaphoreTake(listMutex, portMAX_DELAY);
+          permittedStudents = newList;
+          globalRestrictedStart = tempGlobalStart;
+          globalRestrictedEnd = tempGlobalEnd;
+          xSemaphoreGive(listMutex);
+          
+          Serial.printf("[WSc] List Updated. Count: %d\n", newList.size());
+      }
+      break;
+    case WStype_ERROR:      
+    case WStype_FRAGMENT_TEXT_START:
+    case WStype_FRAGMENT_BIN_START:
+    case WStype_FRAGMENT:
+    case WStype_FRAGMENT_FIN:
+      break;
+  }
+}
+
+// --------------------------------------------------------------------------
 // TASKS
 // --------------------------------------------------------------------------
 void syncDataTask(void *parameter) {
   while (1) {
-    if (WiFi.status() == WL_CONNECTED) {
-      WiFiClient *client = nullptr;
-      if (serverUrl.startsWith("https://")) {
-        WiFiClientSecure *secClient = new WiFiClientSecure();
-        secClient->setInsecure(); // Skip SSL cert verification (OK for ngrok)
-        client = secClient;
-      } else {
-        client = new WiFiClient();
-      }
-      HTTPClient http;
-      http.begin(*client, serverUrl);
-      http.addHeader("Content-Type", "application/json");
+    webSocket.loop();
+    
+    xSemaphoreTake(listMutex, portMAX_DELAY);
+    bool hasData = !trackCache.empty();
+    xSemaphoreGive(listMutex);
+    
+    static unsigned long lastSend = 0;
+    if (hasData && millis() - lastSend > 1000) { 
+        lastSend = millis();
+        String jsonPayload = "{\"tracking\":[";
+        std::vector<TrackRecord> tempCache;
 
-      // 1. Prepare JSON Payload from Cache
-      String jsonPayload = "{\"tracking\":[";
-      std::vector<TrackRecord> tempCache;
-
-      xSemaphoreTake(listMutex, portMAX_DELAY);
-      tempCache = trackCache; // Copy cache to temp
-      xSemaphoreGive(listMutex);
-
-      for (size_t i = 0; i < tempCache.size(); i++) {
-        jsonPayload += "{\"uid\":" + String(tempCache[i].uid) +
-                       ",\"ts\":" + String(tempCache[i].ts) +
-                       ",\"state\":" + String(tempCache[i].state) + "}";
-        if (i < tempCache.size() - 1)
-          jsonPayload += ",";
-      }
-      jsonPayload += "]}";
-
-      // 2. POST (Upload Cache + Get New List)
-      int httpCode = http.POST(jsonPayload);
-
-      if (httpCode == HTTP_CODE_OK) {
-        // Success! Clear uploaded records from main cache
-        if (!tempCache.empty()) {
-          xSemaphoreTake(listMutex, portMAX_DELAY);
-          if (trackCache.size() >= tempCache.size()) {
-            trackCache.erase(trackCache.begin(),
-                             trackCache.begin() + tempCache.size());
-          } else {
-            trackCache.clear();
-          }
-          xSemaphoreGive(listMutex);
-          Serial.printf("[Sync] Uploaded %d tracking records\n",
-                        tempCache.size());
-        }
-
-        // 3. Process Response (Binary List)
-        int len = http.getSize();
-        WiFiClient *stream = http.getStreamPtr();
-
-        std::vector<uint8_t> rxBuffer;
-        uint32_t tempGlobalStart = 0;
-        uint32_t tempGlobalEnd = 0;
-        uint32_t tempCount = 0;
-        bool headerParsed = false;
-        std::vector<StudentPerm> newList;
-
-        while (http.connected() && (len > 0 || len == -1)) {
-          size_t size = stream->available();
-          if (size) {
-            uint8_t chunk[128];
-            int c = stream->readBytes(
-                chunk, ((size > sizeof(chunk)) ? sizeof(chunk) : size));
-            if (c > 0) {
-              rxBuffer.insert(rxBuffer.end(), chunk, chunk + c);
-
-              // Parse Header
-              if (!headerParsed && rxBuffer.size() >= 12) {
-                memcpy(&tempGlobalStart, &rxBuffer[0], 4);
-                memcpy(&tempGlobalEnd, &rxBuffer[4], 4);
-                memcpy(&tempCount, &rxBuffer[8], 4);
-                rxBuffer.erase(rxBuffer.begin(), rxBuffer.begin() + 12);
-                headerParsed = true;
-              }
-
-              // Parse Records
-              if (headerParsed) {
-                size_t processed = 0;
-                while (processed + 12 <= rxBuffer.size()) {
-                  StudentPerm p;
-                  memcpy(&p.uid, &rxBuffer[processed], 4);
-                  memcpy(&p.start, &rxBuffer[processed + 4], 4);
-                  memcpy(&p.end, &rxBuffer[processed + 8], 4);
-                  newList.push_back(p);
-                  processed += 12;
-                }
-                if (processed > 0) {
-                  rxBuffer.erase(rxBuffer.begin(),
-                                 rxBuffer.begin() + processed);
-                }
-              }
-              if (len > 0)
-                len -= c;
-            }
-          }
-          delay(1);
-        }
-
-        // Update Permitted List
         xSemaphoreTake(listMutex, portMAX_DELAY);
-        permittedStudents = newList;
-        globalRestrictedStart = tempGlobalStart;
-        globalRestrictedEnd = tempGlobalEnd;
+        tempCache = trackCache; 
         xSemaphoreGive(listMutex);
 
-        Serial.printf("[Sync] List Updated. Count: %d\n", newList.size());
-
-      } else {
-        Serial.printf("[Sync] HTTP Error: %d\n", httpCode);
-      }
-      http.end();
-      delete client;
-    } else {
-      Serial.println("[Sync] WiFi not connected");
+        for (size_t i = 0; i < tempCache.size(); i++) {
+            jsonPayload += "{\"uid\":" + String(tempCache[i].uid) +
+                           ",\"ts\":" + String(tempCache[i].ts) +
+                           ",\"state\":" + String(tempCache[i].state) + "}";
+            if (i < tempCache.size() - 1)
+              jsonPayload += ",";
+        }
+        jsonPayload += "]}";
+        
+        bool success = webSocket.sendTXT(jsonPayload);
+        if (success) {
+            xSemaphoreTake(listMutex, portMAX_DELAY);
+            if (trackCache.size() >= tempCache.size()) {
+               trackCache.erase(trackCache.begin(), trackCache.begin() + tempCache.size());
+            } else {
+               trackCache.clear();
+            }
+            xSemaphoreGive(listMutex);
+            Serial.printf("[WSc] Sent %d tracking records\n", tempCache.size());
+        }
     }
-
-    // Interval: 1 second
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    
+    vTaskDelay(20 / portTICK_PERIOD_MS); 
   }
 }
 
@@ -356,7 +336,13 @@ void setup() {
     Serial.println("Failed to obtain time");
   }
 
-  // 3. Start Sync Task
+  // 3. Setup WebSocket
+  // use beginSSL for ngrok WSS endpoints
+  webSocket.beginSSL(wsHost, wsPort, wsPath);
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+
+  // 4. Start Sync Task
   xTaskCreatePinnedToCore(syncDataTask, "SyncTask", 10000, NULL, 1, NULL, 0);
 
   // 4. Setup NFC

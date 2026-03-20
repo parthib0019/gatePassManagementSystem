@@ -1,4 +1,5 @@
 from flask import Flask, request, Response
+from flask_cors import CORS
 import sqlite3
 import struct
 import os
@@ -6,8 +7,14 @@ import time
 import csv
 import io
 from datetime import datetime, date
+import json # Added for JSON handling
+from flask_sock import Sock # Added for WebSocket functionality
 
 app = Flask(__name__)
+# Enable CORS for all routes (important for cross-origin requests)
+CORS(app)
+sock = Sock(app) # Initialize Flask-Sock
+active_clients = set() # Keep track of active WebSocket clients
 
 # Database Config
 DB_FILE = 'additionals/database.db'
@@ -66,6 +73,33 @@ def init_db():
 # Initialize on startup
 init_db()
 
+def get_current_binary_payload():
+    """Returns the 12B Header + BLOB representing current global restrictions and daily permissions"""
+    conn = get_db_connection()
+    row = conn.execute('SELECT * FROM RESTRICTED_PERIOD ORDER BY ID DESC LIMIT 1').fetchone()
+    
+    global_start = 0
+    global_end = 0
+    if row:
+        try:
+            global_start = int(row['DATE_TIME_OF_START'])
+            global_end = int(row['DATE_TIME_OF_END'])
+        except ValueError:
+            fmt = "%Y-%m-%d %H:%M:%S"
+            dt_s = datetime.strptime(str(row['DATE_TIME_OF_START']), fmt)
+            dt_e = datetime.strptime(str(row['DATE_TIME_OF_END']), fmt)
+            global_start = int(dt_s.timestamp())
+            global_end = int(dt_e.timestamp())
+            
+    today_str = date.today().isoformat()
+    perm_row = conn.execute('SELECT PERMISSIONS FROM PERMISSION_LIST WHERE DATE_TIME = ?', (today_str,)).fetchone()
+    blob = perm_row['PERMISSIONS'] if perm_row else b''
+    conn.close()
+    
+    record_count = len(blob) // 12
+    header = struct.pack('<III', global_start, global_end, record_count)
+    return header + blob
+
 @app.route('/', methods=['GET'])
 def home():
     return "GatePass Server V2 Running"
@@ -115,6 +149,62 @@ def today_list():
         mimetype="text/csv",
         headers={"Content-disposition": f"attachment; filename=permitted_students_{today_str}.csv"}
     )
+
+def handle_tracking_data(tracks):
+    """Save incoming tracking data from ESP32 to DB"""
+    if not tracks: return
+    conn = get_db_connection()
+    try:
+        for track in tracks:
+            uid = track.get('uid')
+            ts = track.get('ts')
+            state = track.get('state')
+            if uid is not None and ts is not None and state is not None:
+                dt_str = datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S')
+                conn.execute('INSERT INTO Student_tracker (RFID, STATE, DATE_TIME) VALUES (?, ?, ?)',
+                             (uid, state, dt_str))
+        conn.commit()
+        print(f"Synced {len(tracks)} tracking records.")
+    except Exception as e:
+        print(f"WS Sync Error: {e}")
+    finally:
+        conn.close()
+
+@sock.route('/ws')
+def ws_gatepass(ws):
+    active_clients.add(ws)
+    print("New WebSocket client connected.")
+    try:
+        # Immediately send current binary state upon connection
+        initial_payload = get_current_binary_payload()
+        ws.send(initial_payload)
+        
+        # Listen for tracking uploads
+        while True:
+            data = ws.receive()
+            if data:
+                try:
+                    json_data = json.loads(data)
+                    if 'tracking' in json_data:
+                        handle_tracking_data(json_data['tracking'])
+                except json.JSONDecodeError:
+                    print("Received invalid JSON on WS")
+    except Exception as e:
+        print(f"WS Disconnected: {e}")
+    finally:
+        if ws in active_clients:
+            active_clients.remove(ws)
+
+def broadcast_payload():
+    """Send the current binary payload to all active clients"""
+    new_payload = get_current_binary_payload()
+    dead_clients = set()
+    for client in active_clients:
+        try:
+            client.send(new_payload)
+        except Exception:
+            dead_clients.add(client)
+    active_clients.difference_update(dead_clients)
 
 @app.route('/PermitedPDFSubmission', methods=['POST'])
 def submit_permissions():
@@ -213,6 +303,7 @@ def submit_permissions():
         return f"DB error: {e}", 500
         
     conn.close()
+    broadcast_payload()  # Push update to ESP32s
     return f"Success. Total records for {today_str}: {len(final_records)}", 200
 
 @app.route('/restrictedTimeDeclearation', methods=['POST'])
@@ -233,6 +324,7 @@ def set_restricted_time():
                      (start, end))
         conn.commit()
         conn.close()
+        broadcast_payload()  # Push update to ESP32s
         return "Restricted Period Set", 200
     except ValueError:
         return "Invalid integers", 400
@@ -241,83 +333,17 @@ def set_restricted_time():
 
 @app.route('/permitted_students', methods=['GET', 'POST'])
 def get_permitted_students():
-    """
-    Protocol V2:
-    GET: Return Permitted List + Global Restrictions
-    POST: Receive {"exits": [...]} -> Save to DB -> Return Permitted List (Same as GET)
-    
-    Header (12B): [Global_Start(4)][Global_End(4)][Record_Count(4)]
-    Body (N*12B): [RFID(4)][Start(4)][End(4)] ...
-    """
-    conn = get_db_connection()
-    
-    # --- HANDLE POST (Sync Tracking) ---
+    """Legacy HTTP Sync route - Supported alongside WebSockets"""
     if request.method == 'POST':
         try:
             data = request.get_json()
             if data and 'tracking' in data:
-                tracks = data['tracking'] # List of {uid, ts, state}
-                
-                # Bulk Insert
-                for track in tracks:
-                    uid = track.get('uid')
-                    ts = track.get('ts') # Unix Timestamp from ESP32
-                    state = track.get('state')
-                    
-                    if uid is not None and ts is not None and state is not None:
-                        # Convert TS to Readable Date Time
-                        dt_str = datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S')
-                        
-                        conn.execute('INSERT INTO Student_tracker (RFID, STATE, DATE_TIME) VALUES (?, ?, ?)',
-                                     (uid, state, dt_str))
-                conn.commit()
-                print(f"Synced {len(tracks)} tracking records.")
-        except Exception as e:
-            print(f"Sync Error: {e}")
+                handle_tracking_data(data['tracking'])
+        except Exception:
             pass
-    
-    # 1. Get Restricted Period for TODAY
-    # Need to filter by "today"? User schema has just ID/Start/End. 
-    # Assumption: We take the LATEST entry added? Or specific to today?
-    # User said: "check if there is any restricted time limit... for the current day"
-    # We'll assume the client pushes correct timestamps. We'll fetch the latest one that *overlaps* today?
-    # Simpler: Fetch the *last* entry added. 
-    
-    
-    # Get latest restriction
-    # Get latest restriction
-    row = conn.execute('SELECT * FROM RESTRICTED_PERIOD ORDER BY ID DESC LIMIT 1').fetchone()
-    if row:
-        # Check if it covers "today" roughly? 
-        # Or just blindly send it and let ESP32 decide?
-        # User logic: "send the binary data... and check if there is any restricted time limit"
-        # We will send the timestamps.
-        # Parse SQLite DATETIME string (YYYY-MM-DD HH:MM:SS) to Unix Timestamp
-        try:
-            # Check if it's already an integer (old data?)
-            global_start = int(row['DATE_TIME_OF_START'])
-            global_end = int(row['DATE_TIME_OF_END'])
-        except ValueError:
-            # Parse string format
-            fmt = "%Y-%m-%d %H:%M:%S"
-            dt_s = datetime.strptime(str(row['DATE_TIME_OF_START']), fmt)
-            dt_e = datetime.strptime(str(row['DATE_TIME_OF_END']), fmt)
-            global_start = int(dt_s.timestamp())
-            global_end = int(dt_e.timestamp())
-        
-    # 2. Get Permissions for TODAY
-    today_str = date.today().isoformat()
-    perm_row = conn.execute('SELECT PERMISSIONS FROM PERMISSION_LIST WHERE DATE_TIME = ?', (today_str,)).fetchone()
-    
-    blob = perm_row['PERMISSIONS'] if perm_row else b''
-    
-    conn.close()
-    
-    # 3. Construct Response
-    record_count = len(blob) // 12
-    header = struct.pack('<III', global_start, global_end, record_count)
-    
-    return Response(header + blob, mimetype='application/octet-stream')
+            
+    payload = get_current_binary_payload()
+    return Response(payload, mimetype='application/octet-stream')
 
 @app.route('/get_tracker_csv', methods=['POST'])
 def get_tracker_csv():
