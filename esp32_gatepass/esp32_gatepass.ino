@@ -37,11 +37,9 @@ const long gmtOffset_sec = 19800; // UTC +5:30 (India Standard Time)
 const int daylightOffset_sec = 0;
 
 // Replace with your ngrok URL (must be updated every time ngrok restarts)
-String serverUrl = "https://nonmetalliferous-callen-anciently.ngrok-free.dev/"
-                   "permitted_students";
-String timeServerUrl ="https://nonmetalliferous-callen-anciently.ngrok-free.dev/current_time";
+String timeServerUrl ="https://gatepass.rkmvmfamily.in/current_time";
 
-String wsHost = "nonmetalliferous-callen-anciently.ngrok-free.dev";
+String wsHost = "gatepass.rkmvmfamily.in";
 int wsPort = 443;
 String wsPath = "/ws";
 
