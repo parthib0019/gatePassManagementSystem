@@ -43,6 +43,12 @@ def init_db():
             );
         ''')
         
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS OUT_STUDENTS (
+                RFID INTEGER PRIMARY KEY
+            );
+        ''')
+        
         # Table for Free Time Slots Configuration
         conn.execute('''
             CREATE TABLE IF NOT EXISTS FREE_TIME_LOG (
@@ -168,8 +174,18 @@ def get_current_binary_payload():
         free_time_blob.extend(struct.pack('<I', int(t)))
         
     perm_blob = Permitted_List_genarater()
+    
+    # Pack out_students
+    conn = get_db_connection()
+    out_rows = conn.execute('SELECT RFID FROM OUT_STUDENTS').fetchall()
+    conn.close()
+    
+    out_blob = bytearray()
+    out_blob.extend(struct.pack('<I', len(out_rows)))
+    for r in out_rows:
+        out_blob.extend(struct.pack('<I', int(r['RFID'])))
         
-    return header + free_time_blob + perm_blob
+    return header + free_time_blob + perm_blob + out_blob
 
 @app.route('/', methods=['GET'])
 def home():
@@ -212,6 +228,14 @@ def handle_tracking_data(tracks):
                 dt_str = datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S')
                 conn.execute('INSERT INTO Student_tracker (RFID, STATE, DATE_TIME) VALUES (?, ?, ?)',
                              (uid, state, dt_str))
+                
+                # OUT_STUDENTS logic
+                if state == 0: # Exit
+                    conn.execute('INSERT OR IGNORE INTO OUT_STUDENTS (RFID) VALUES (?)', (uid,))
+                elif state == 1: # Entry
+                    cursor = conn.execute('DELETE FROM OUT_STUDENTS WHERE RFID = ?', (uid,))
+                    if cursor.rowcount == 0:
+                        print(f"Log: ID {uid} not found in OUT_STUDENTS during entry.")
         conn.commit()
         print(f"Synced {len(tracks)} tracking records.")
     except Exception as e:

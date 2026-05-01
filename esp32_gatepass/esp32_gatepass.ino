@@ -80,15 +80,14 @@ struct TrackRecord {
 std::vector<StudentPerm> permittedStudents;
 std::vector<TrackRecord> trackCache;
 std::vector<uint32_t> freeTimeSlots;
+std::vector<uint32_t> out_Stu;
 
 SemaphoreHandle_t listMutex;
 
 // NFC Objects
 // Using Hardware SPI (Default VSPI pins: 18, 19, 23)
 Adafruit_PN532 nfc1(PN532_SS_1);
-Adafruit_PN532 nfc2(PN532_SS_2);
 bool nfc1Connected = false;
-bool nfc2Connected = false;
 unsigned long lastCardRead = 0;
 const int COOLDOWN_MS = 2000;
 
@@ -152,12 +151,28 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
               }
           }
           
+          std::vector<uint32_t> newOutStu;
+          if (length >= processed + 4) {
+              uint32_t outCount = 0;
+              memcpy(&outCount, &payload[processed], 4);
+              processed += 4;
+              
+              for (uint32_t i = 0; i < outCount; i++) {
+                  if (processed + 4 > length) break;
+                  uint32_t rfid = 0;
+                  memcpy(&rfid, &payload[processed], 4);
+                  newOutStu.push_back(rfid);
+                  processed += 4;
+              }
+          }
+          
           xSemaphoreTake(listMutex, portMAX_DELAY);
           permittedStudents = newList;
           freeTimeSlots = newFreeTimes;
+          out_Stu = newOutStu;
           xSemaphoreGive(listMutex);
           
-          Serial.printf("[WSc] List Updated. Free slots: %d, Students: %d\n", freeTimeCount, newList.size());
+          Serial.printf("[WSc] List Updated. Free slots: %d, Students: %d, Out: %d\n", freeTimeCount, newList.size(), newOutStu.size());
       }
       break;
     case WStype_ERROR:      
@@ -241,6 +256,14 @@ void signalGranted() {
   setMatrixColor(pixels.Color(0, 255, 0));
   playTone(1, 200, 0);
   delay(1000); // Keep matrix green for a bit
+  setMatrixColor(pixels.Color(255, 255, 255)); // Revert to white
+}
+
+void signalEntry() {
+  // Blue Matrix + 2 Beeps
+  setMatrixColor(pixels.Color(0, 0, 255));
+  playTone(2, 200, 100);
+  delay(1000); // Keep matrix blue for a bit
   setMatrixColor(pixels.Color(255, 255, 255)); // Revert to white
 }
 
@@ -366,27 +389,16 @@ void setup() {
   // 4. Setup NFC
   // manually set SS to HIGH to deselect
   pinMode(PN532_SS_1, OUTPUT);
-  pinMode(PN532_SS_2, OUTPUT);
   digitalWrite(PN532_SS_1, HIGH);
-  digitalWrite(PN532_SS_2, HIGH);
 
   SPI.begin(PN532_SCK, PN532_MISO, PN532_MOSI,
             -1); // -1 to disable default SS handling
   delay(100);
 
-  Serial.print("[Setup] Init Reader 1 (EXIT)... ");
+  Serial.print("[Setup] Init Reader... ");
   if (initializeNFC(nfc1)) {
     Serial.println("OK");
     nfc1Connected = true;
-  } else {
-    Serial.println("FAILED");
-  }
-  delay(100);
-
-  Serial.print("[Setup] Init Reader 2 (ENTRY)... ");
-  if (initializeNFC(nfc2)) {
-    Serial.println("OK");
-    nfc2Connected = true;
   } else {
     Serial.println("FAILED");
   }
@@ -400,7 +412,7 @@ void loop() {
   time_t now = time(nullptr);
 
   // --------------------------------------------------------
-  // Check Reader 1 (EXIT) - Logic: Check Permissions -> Log State 0
+  // Check Reader Logic: Check State -> Check Permissions
   // --------------------------------------------------------
   if (nfc1Connected) {
     uint8_t uid[7];
@@ -417,90 +429,77 @@ void loop() {
                    ((unsigned long)uid[1] << 8) | ((unsigned long)uid[0]);
         }
 
-        Serial.printf("\n>>> [Reader 1: EXIT] Card Detect: %u\n", cardID);
+        Serial.printf("\n>>> [Reader] Card Detect: %u\n", cardID);
 
-        // --- EXIT PERMISSION CHECK ---
-        bool accessGranted = false;
         xSemaphoreTake(listMutex, portMAX_DELAY);
-
-        bool inFreeTime = false;
-        for (size_t i = 0; i + 1 < freeTimeSlots.size(); i += 2) {
-            if (now >= freeTimeSlots[i] && now <= freeTimeSlots[i+1]) {
-                inFreeTime = true;
+        
+        // --- STEP 1: CHECK IF STUDENT IS OUT ---
+        bool isOut = false;
+        for (auto it = out_Stu.begin(); it != out_Stu.end(); ++it) {
+            if (*it == cardID) {
+                isOut = true;
+                out_Stu.erase(it);
                 break;
             }
         }
-
-        if (inFreeTime) {
-            accessGranted = true;
-            Serial.println("Mode: Free Time (Open)");
+        
+        if (isOut) {
+            // It's an ENTRY
+            Serial.println("[Scanner] ENTRY LOGGED");
+            trackCache.push_back({(uint32_t)cardID, (uint32_t)now, 1});
+            xSemaphoreGive(listMutex);
+            signalEntry();
         } else {
-            Serial.println("Mode: Restricted (Checking List)");
-            bool found = false;
+            // It's an EXIT attempt
+            bool accessGranted = false;
             
-            for (auto studentIt = permittedStudents.begin(); studentIt != permittedStudents.end(); ++studentIt) {
-                if (studentIt->uid == cardID) {
-                    for (size_t i = 0; i + 1 < studentIt->slots.size(); i += 2) {
-                        if (now >= studentIt->slots[i] && now <= studentIt->slots[i+1]) {
-                            found = true;
-                            accessGranted = true;
-                            Serial.println("Student Interval: Match");
-                            
-                            // Erase this slot to prevent double-usage before server sync
-                            studentIt->slots.erase(studentIt->slots.begin() + i, studentIt->slots.begin() + i + 2);
-                            break;
-                        }
-                    }
-                    if (found) break; // Break out of student loop if we granted access
+            bool inFreeTime = false;
+            for (size_t i = 0; i + 1 < freeTimeSlots.size(); i += 2) {
+                if (now >= freeTimeSlots[i] && now <= freeTimeSlots[i+1]) {
+                    inFreeTime = true;
+                    break;
                 }
             }
-            if (!found)
-                Serial.println("ID Not in Permitted List or No Active Slots");
+
+            if (inFreeTime) {
+                accessGranted = true;
+                out_Stu.push_back(cardID);
+                Serial.println("Mode: Free Time (Open)");
+            } else {
+                Serial.println("Mode: Restricted (Checking List)");
+                bool found = false;
+                
+                for (auto studentIt = permittedStudents.begin(); studentIt != permittedStudents.end(); ++studentIt) {
+                    if (studentIt->uid == cardID) {
+                        for (size_t i = 0; i + 1 < studentIt->slots.size(); i += 2) {
+                            if (now >= studentIt->slots[i] && now <= studentIt->slots[i+1]) {
+                                found = true;
+                                accessGranted = true;
+                                Serial.println("Student Interval: Match");
+                                
+                                studentIt->slots.erase(studentIt->slots.begin() + i, studentIt->slots.begin() + i + 2);
+                                out_Stu.push_back(cardID);
+                                break;
+                            }
+                        }
+                        if (found) break; 
+                    }
+                }
+                if (!found)
+                    Serial.println("ID Not in Permitted List or No Active Slots");
+            }
+
+            if (accessGranted) {
+              Serial.println("[Scanner] ACCESS GRANTED (EXIT)");
+              trackCache.push_back({(uint32_t)cardID, (uint32_t)now, 0});
+              xSemaphoreGive(listMutex);
+              signalGranted();
+            } else {
+              Serial.println("[Scanner] ACCESS DENIED");
+              xSemaphoreGive(listMutex);
+              signalDenied();
+            }
         }
-        xSemaphoreGive(listMutex);
-
-        if (accessGranted) {
-          Serial.println("[Scanner 1] ACCESS GRANTED");
-          // Cache Exit (State 0)
-          xSemaphoreTake(listMutex, portMAX_DELAY);
-          trackCache.push_back({(uint32_t)cardID, (uint32_t)now, 0});
-          xSemaphoreGive(listMutex);
-          signalGranted();
-        } else {
-          Serial.println("[Scanner 1] ACCESS DENIED");
-          signalDenied();
-        }
-      }
-    }
-  }
-
-  // --------------------------------------------------------
-  // Check Reader 2 (ENTRY) - Logic: Always Open -> Log State 1
-  // --------------------------------------------------------
-  if (nfc2Connected) {
-    uint8_t uid[7];
-    uint8_t uidLength;
-
-    if (nfc2.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 50)) {
-      if (millis() - lastCardRead > COOLDOWN_MS) {
-        lastCardRead = millis();
-
-        unsigned long cardID = 0;
-        if (uidLength == 4) {
-          cardID = ((unsigned long)uid[3] << 24) |
-                   ((unsigned long)uid[2] << 16) |
-                   ((unsigned long)uid[1] << 8) | ((unsigned long)uid[0]);
-        }
-
-        Serial.printf("\n>>> [Reader 2: ENTRY] Card Detect: %u\n", cardID);
-
-        // --- ENTRY LOGIC (Always Log State 1) ---
-        xSemaphoreTake(listMutex, portMAX_DELAY);
-        trackCache.push_back({(uint32_t)cardID, (uint32_t)now, 1});
-        xSemaphoreGive(listMutex);
-
-        Serial.println("[Scanner 2] Entry Logged");
-        signalGranted();
       }
     }
   }
