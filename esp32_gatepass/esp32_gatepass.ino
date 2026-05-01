@@ -12,8 +12,7 @@
  * - Individual Student Time Slots
  *
  * Hardware Config:
- * - Green LED: D2
- * - Red LED:   D4
+ * - RGB LED Matrix: Pin 6 (16 pixels)
  * - RFID (PN532): SCK=18, MISO=19, MOSI=23, SS=5 (VSPI)
  */
 #include <Adafruit_PN532.h>
@@ -26,6 +25,12 @@
 #include <algorithm>
 #include <time.h>
 #include <vector>
+#include <Adafruit_NeoPixel.h>
+
+#define PIN 14
+#define NUMPIXELS 16
+
+Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
 
 // --------------------------------------------------------------------------
 // CONFIGURATION
@@ -37,23 +42,22 @@ const long gmtOffset_sec = 19800; // UTC +5:30 (India Standard Time)
 const int daylightOffset_sec = 0;
 
 // Replace with your ngrok URL (must be updated every time ngrok restarts)
-String timeServerUrl ="https://gatepass.rkmvmfamily.in/current_time";
+// String timeServerUrl ="https://gatepass.rkmvmfamily.in/current_time";
+String timeServerUrl ="https://nonmetalliferous-callen-anciently.ngrok-free.dev/current_time";
 
-String wsHost = "gatepass.rkmvmfamily.in";
+String wsHost = "nonmetalliferous-callen-anciently.ngrok-free.dev";
 int wsPort = 443;
 String wsPath = "/ws";
 
 WebSocketsClient webSocket;
 
 // Pin Config
-#define LED_GREEN 13
-#define LED_RED 4
 #define PN532_SCK 18
 #define PN532_MISO 19
 #define PN532_MOSI 23
 #define PN532_SS_1 5
 #define PN532_SS_2 22
-#define buzzer 12
+#define buzzer 21
 
 // --------------------------------------------------------------------------
 // DATA STRUCTURES
@@ -61,8 +65,7 @@ WebSocketsClient webSocket;
 
 struct StudentPerm {
   uint32_t uid;
-  uint32_t start; // Unix Timestamp
-  uint32_t end;   // Unix Timestamp
+  std::vector<uint32_t> slots;
 };
 
 struct TrackRecord {
@@ -76,8 +79,7 @@ struct TrackRecord {
 // --------------------------------------------------------------------------
 std::vector<StudentPerm> permittedStudents;
 std::vector<TrackRecord> trackCache;
-time_t globalRestrictedStart = 0;
-time_t globalRestrictedEnd = 0;
+std::vector<uint32_t> freeTimeSlots;
 
 SemaphoreHandle_t listMutex;
 
@@ -106,33 +108,56 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       break;
     case WStype_BIN:
       Serial.printf("[WSc] get binary length: %u\n", length);
-      if (length >= 12) {
-          uint32_t tempGlobalStart = 0;
-          uint32_t tempGlobalEnd = 0;
-          uint32_t recordCount = 0;
+      if (length >= 4) {
+          uint32_t freeTimeCount = 0;
+          memcpy(&freeTimeCount, &payload[0], 4);
           
-          memcpy(&tempGlobalStart, &payload[0], 4);
-          memcpy(&tempGlobalEnd, &payload[4], 4);
-          memcpy(&recordCount, &payload[8], 4);
+          size_t processed = 4;
+          std::vector<uint32_t> newFreeTimes;
+          
+          if (length >= processed + (freeTimeCount * 8)) {
+              for (uint32_t i = 0; i < freeTimeCount * 2; i++) {
+                  uint32_t t;
+                  memcpy(&t, &payload[processed], 4);
+                  newFreeTimes.push_back(t);
+                  processed += 4;
+              }
+          }
           
           std::vector<StudentPerm> newList;
-          size_t processed = 12;
-          while (processed + 12 <= length) {
-              StudentPerm p;
-              memcpy(&p.uid, &payload[processed], 4);
-              memcpy(&p.start, &payload[processed + 4], 4);
-              memcpy(&p.end, &payload[processed + 8], 4);
-              newList.push_back(p);
-              processed += 12;
+          if (length >= processed + 4) {
+              uint32_t studentCount = 0;
+              memcpy(&studentCount, &payload[processed], 4);
+              processed += 4;
+              
+              for (uint32_t i = 0; i < studentCount; i++) {
+                  if (processed + 8 > length) break;
+                  StudentPerm p;
+                  memcpy(&p.uid, &payload[processed], 4);
+                  
+                  uint32_t slotCount = 0;
+                  memcpy(&slotCount, &payload[processed + 4], 4);
+                  processed += 8;
+                  
+                  for (uint32_t j = 0; j < slotCount; j++) {
+                      if (processed + 8 > length) break;
+                      uint32_t start, end;
+                      memcpy(&start, &payload[processed], 4);
+                      memcpy(&end, &payload[processed + 4], 4);
+                      p.slots.push_back(start);
+                      p.slots.push_back(end);
+                      processed += 8;
+                  }
+                  newList.push_back(p);
+              }
           }
           
           xSemaphoreTake(listMutex, portMAX_DELAY);
           permittedStudents = newList;
-          globalRestrictedStart = tempGlobalStart;
-          globalRestrictedEnd = tempGlobalEnd;
+          freeTimeSlots = newFreeTimes;
           xSemaphoreGive(listMutex);
           
-          Serial.printf("[WSc] List Updated. Count: %d\n", newList.size());
+          Serial.printf("[WSc] List Updated. Free slots: %d, Students: %d\n", freeTimeCount, newList.size());
       }
       break;
     case WStype_ERROR:      
@@ -204,33 +229,27 @@ void playTone(int count, int onDuration, int offDuration) {
   }
 }
 
+void setMatrixColor(uint32_t color) {
+  for(int i = 0; i < NUMPIXELS; i++) {
+    pixels.setPixelColor(i, color);
+  }
+  pixels.show();
+}
+
 void signalGranted() {
-  // Green LED + 1 Beep
-  digitalWrite(LED_GREEN, HIGH);
+  // Green Matrix + 1 Beep
+  setMatrixColor(pixels.Color(0, 255, 0));
   playTone(1, 200, 0);
-  delay(1000); // Keep LED on for a bit
-  digitalWrite(LED_GREEN, LOW);
+  delay(1000); // Keep matrix green for a bit
+  setMatrixColor(pixels.Color(255, 255, 255)); // Revert to white
 }
 
 void signalDenied() {
-  // Red LED + 3 Fast Beeps
-  digitalWrite(LED_RED, HIGH);
+  // Red Matrix + 3 Fast Beeps
+  setMatrixColor(pixels.Color(255, 0, 0));
   playTone(5, 100, 100);
   delay(500);
-  digitalWrite(LED_RED, LOW);
-}
-
-void blinkLED(int pin) {
-  // Deprecated, keeping for compatibility if needed, but logic moved to signals
-  if (pin == LED_GREEN)
-    signalGranted();
-  else if (pin == LED_RED)
-    signalDenied();
-  else {
-    digitalWrite(pin, HIGH);
-    delay(500);
-    digitalWrite(pin, LOW);
-  }
+  setMatrixColor(pixels.Color(255, 255, 255)); // Revert to white
 }
 
 bool initializeNFC(Adafruit_PN532 &nfc_obj) {
@@ -293,12 +312,13 @@ void syncTimeWithServer() {
 void setup() {
   Serial.begin(115200);
 
-  pinMode(LED_GREEN, OUTPUT);
-  pinMode(LED_RED, OUTPUT);
   pinMode(buzzer, OUTPUT);
-  digitalWrite(LED_GREEN, LOW);
-  digitalWrite(LED_RED, LOW);
   digitalWrite(buzzer, LOW);
+
+  // Initialize NeoPixel Matrix
+  pixels.begin();
+  pixels.setBrightness(10); // Set brightness to avoid excessive current draw
+  setMatrixColor(pixels.Color(255, 255, 255)); // Set default to white
 
   // Startup Sound
   playTone(1, 100, 0);
@@ -403,35 +423,39 @@ void loop() {
         bool accessGranted = false;
         xSemaphoreTake(listMutex, portMAX_DELAY);
 
-        // Logic 1: Default Open (Green) if no restricted period
-        if (globalRestrictedStart == 0 && globalRestrictedEnd == 0) {
-          accessGranted = true;
-          Serial.println("Mode: Unrestricted (Open)");
-        }
-        // Logic 2: Open if OUTSIDE restricted period
-        else if (now < globalRestrictedStart && now > globalRestrictedEnd) {
-          accessGranted = true;
-          Serial.println("Mode: Outside Restriction (Open)");
-        }
-        // Logic 3: Restricted Period - Check List
-        else {
-          Serial.println("Mode: Restricted (Checking List)");
-          bool found = false;
-          for (const auto &student : permittedStudents) {
-            if (student.uid == cardID) {
-              if (now >= student.start && now <= student.end) {
-                found = true;
-                accessGranted = true;
-                Serial.println("Student Interval: Match");
-              } else {
-                found = true;
-                Serial.println("Student Interval: Expired/Future");
-              }
-              break;
+        bool inFreeTime = false;
+        for (size_t i = 0; i + 1 < freeTimeSlots.size(); i += 2) {
+            if (now >= freeTimeSlots[i] && now <= freeTimeSlots[i+1]) {
+                inFreeTime = true;
+                break;
             }
-          }
-          if (!found)
-            Serial.println("ID Not in Permitted List");
+        }
+
+        if (inFreeTime) {
+            accessGranted = true;
+            Serial.println("Mode: Free Time (Open)");
+        } else {
+            Serial.println("Mode: Restricted (Checking List)");
+            bool found = false;
+            
+            for (auto studentIt = permittedStudents.begin(); studentIt != permittedStudents.end(); ++studentIt) {
+                if (studentIt->uid == cardID) {
+                    for (size_t i = 0; i + 1 < studentIt->slots.size(); i += 2) {
+                        if (now >= studentIt->slots[i] && now <= studentIt->slots[i+1]) {
+                            found = true;
+                            accessGranted = true;
+                            Serial.println("Student Interval: Match");
+                            
+                            // Erase this slot to prevent double-usage before server sync
+                            studentIt->slots.erase(studentIt->slots.begin() + i, studentIt->slots.begin() + i + 2);
+                            break;
+                        }
+                    }
+                    if (found) break; // Break out of student loop if we granted access
+                }
+            }
+            if (!found)
+                Serial.println("ID Not in Permitted List or No Active Slots");
         }
         xSemaphoreGive(listMutex);
 

@@ -32,23 +32,23 @@ def init_db():
         
     conn = get_db_connection()
     try:
-        # Table for Permission Blobs (One blob per day)
-        # Storing DATE_TIME as TEXT (YYYY-MM-DD) for simplicity in SQLite
         conn.execute('''
             CREATE TABLE IF NOT EXISTS PERMISSION_LIST (
-                DATE_TIME TEXT PRIMARY KEY,
-                PERMISSIONS BLOB NOT NULL
+                ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                STARTING_DATE TEXT NOT NULL,
+                ENDING_DATE TEXT NOT NULL,
+                STARTING_TIME TEXT NOT NULL,
+                ENDING_TIME TEXT NOT NULL,
+                RFID TEXT NOT NULL
             );
         ''')
         
-        # Table for Restricted Periods
-        # ID Auto-increment
-        # Start/End as Unix Timestamps (INTEGERS) based on user feedback
+        # Table for Free Time Slots Configuration
         conn.execute('''
-            CREATE TABLE IF NOT EXISTS RESTRICTED_PERIOD (
+            CREATE TABLE IF NOT EXISTS FREE_TIME_LOG (
                 ID INTEGER PRIMARY KEY AUTOINCREMENT,
-                DATE_TIME_OF_START INTEGER NOT NULL,
-                DATE_TIME_OF_END INTEGER NOT NULL
+                CONFIG_DATE DATE NOT NULL,
+                TIME_LIST TEXT NOT NULL
             );
         ''')
         
@@ -73,32 +73,103 @@ def init_db():
 # Initialize on startup
 init_db()
 
-def get_current_binary_payload():
-    """Returns the 12B Header + BLOB representing current global restrictions and daily permissions"""
-    conn = get_db_connection()
-    row = conn.execute('SELECT * FROM RESTRICTED_PERIOD ORDER BY ID DESC LIMIT 1').fetchone()
-    
-    global_start = 0
-    global_end = 0
-    if row:
-        try:
-            global_start = int(row['DATE_TIME_OF_START'])
-            global_end = int(row['DATE_TIME_OF_END'])
-        except ValueError:
-            fmt = "%Y-%m-%d %H:%M:%S"
-            dt_s = datetime.strptime(str(row['DATE_TIME_OF_START']), fmt)
-            dt_e = datetime.strptime(str(row['DATE_TIME_OF_END']), fmt)
-            global_start = int(dt_s.timestamp())
-            global_end = int(dt_e.timestamp())
-            
+def Permitted_List_genarater():
     today_str = date.today().isoformat()
-    perm_row = conn.execute('SELECT PERMISSIONS FROM PERMISSION_LIST WHERE DATE_TIME = ?', (today_str,)).fetchone()
-    blob = perm_row['PERMISSIONS'] if perm_row else b''
+    conn = get_db_connection()
+    
+    # 1. Normal data
+    normal_data = conn.execute('''
+        SELECT * FROM PERMISSION_LIST 
+        WHERE STARTING_DATE <= ? AND ENDING_DATE >= ?
+    ''', (today_str, today_str)).fetchall()
+    
+    # 2. Today's exits
+    tracker_data = conn.execute('''
+        SELECT RFID, DATE_TIME FROM Student_tracker
+        WHERE STATE = 0 AND DATE_TIME LIKE ?
+    ''', (today_str + '%',)).fetchall()
+    
+    exits = {}
+    for row in tracker_data:
+        rfid = str(row['RFID'])
+        if rfid not in exits:
+            exits[rfid] = []
+        exits[rfid].append(row['DATE_TIME'])
+        
+    # 3. Filter
+    valid_grouped = {}
+    fmt = "%Y-%m-%d %H:%M:%S"
+    
+    for row in normal_data:
+        rfid = str(row['RFID'])
+        start_time_str = row['STARTING_TIME']
+        end_time_str = row['ENDING_TIME']
+        
+        start_dt_str = f"{today_str} {start_time_str}"
+        end_dt_str = f"{today_str} {end_time_str}"
+        
+        used = False
+        if rfid in exits:
+            for exit_dt in exits[rfid]:
+                if start_dt_str <= exit_dt <= end_dt_str:
+                    used = True
+                    break
+        
+        if not used:
+            try:
+                start_ts = int(datetime.strptime(start_dt_str, fmt).timestamp())
+                end_ts = int(datetime.strptime(end_dt_str, fmt).timestamp())
+                if rfid not in valid_grouped:
+                    valid_grouped[rfid] = []
+                valid_grouped[rfid].append((start_ts, end_ts))
+            except Exception as e:
+                print(f"Time parse error: {e}")
+                
     conn.close()
     
-    record_count = len(blob) // 12
-    header = struct.pack('<III', global_start, global_end, record_count)
-    return header + blob
+    # Pack to binary
+    # Format: [student_count(4)] then for each student: [RFID(4)][slot_count(4)][start1][end1]...
+    blob = bytearray()
+    blob.extend(struct.pack('<I', len(valid_grouped)))
+    for rfid_str, slots in valid_grouped.items():
+        try:
+            rfid_int = int(rfid_str)
+            blob.extend(struct.pack('<II', rfid_int, len(slots)))
+            for start_ts, end_ts in slots:
+                blob.extend(struct.pack('<II', start_ts, end_ts))
+        except ValueError:
+            pass # Invalid RFID
+            
+    return blob
+
+def get_current_binary_payload():
+    """Returns the Header + BLOB representing current free times and daily permissions"""
+    conn = get_db_connection()
+    row = conn.execute('SELECT * FROM FREE_TIME_LOG ORDER BY ID DESC LIMIT 1').fetchone()
+    
+    free_times = []
+    if row and row['TIME_LIST']:
+        try:
+            free_times = json.loads(row['TIME_LIST'])
+        except Exception as e:
+            print(f"Error parsing TIME_LIST: {e}")
+            free_times = []
+            
+    conn.close()
+    
+    free_time_count = len(free_times) // 2
+    
+    # Pack header: [free_time_count (4)]
+    header = struct.pack('<I', free_time_count)
+    
+    # Pack free times
+    free_time_blob = bytearray()
+    for t in free_times:
+        free_time_blob.extend(struct.pack('<I', int(t)))
+        
+    perm_blob = Permitted_List_genarater()
+        
+    return header + free_time_blob + perm_blob
 
 @app.route('/', methods=['GET'])
 def home():
@@ -111,39 +182,17 @@ def current_time():
 
 @app.route('/todayList', methods=['GET'])
 def today_list():
-    """
-    Fetch today's permitted student list from the binary blob,
-    convert to CSV, and send as a download.
-    """
-    today_str = date.today().isoformat()  # YYYY-MM-DD
-    
+    today_str = date.today().isoformat()
     conn = get_db_connection()
-    try:
-        row = conn.execute('SELECT PERMISSIONS FROM PERMISSION_LIST WHERE DATE_TIME = ?', (today_str,)).fetchone()
-    except Exception as e:
-        conn.close()
-        return f"DB Error: {e}", 500
+    rows = conn.execute('SELECT * FROM PERMISSION_LIST WHERE STARTING_DATE <= ? AND ENDING_DATE >= ?', (today_str, today_str)).fetchall()
     conn.close()
     
-    if not row or not row['PERMISSIONS']:
-        return "No permissions found for today", 404
-    
-    blob = row['PERMISSIONS']
-    
-    # Parse binary: [RFID(4)][START(4)][END(4)] per record, little-endian
-    chunk_size = 12
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(['RFID', 'INTERVAL_START', 'INTERVAL_END', 'START_READABLE', 'END_READABLE'])
-    
-    for i in range(0, len(blob), chunk_size):
-        chunk = blob[i:i+chunk_size]
-        if len(chunk) == chunk_size:
-            rfid, start_ts, end_ts = struct.unpack('<III', chunk)
-            start_str = datetime.fromtimestamp(start_ts).strftime('%Y-%m-%d %H:%M:%S')
-            end_str = datetime.fromtimestamp(end_ts).strftime('%Y-%m-%d %H:%M:%S')
-            writer.writerow([rfid, start_ts, end_ts, start_str, end_str])
-    
+    writer.writerow(['RFID', 'STARTING_DATE', 'ENDING_DATE', 'STARTING_TIME', 'ENDING_TIME'])
+    for r in rows:
+        writer.writerow([r['RFID'], r['STARTING_DATE'], r['ENDING_DATE'], r['STARTING_TIME'], r['ENDING_TIME']])
+        
     return Response(
         output.getvalue(),
         mimetype="text/csv",
@@ -210,9 +259,7 @@ def broadcast_payload():
 def submit_permissions():
     """
     Form Submission: 'password', 'file' (CSV)
-    CSV Format: RFID, INTERVAL_START, INTERVAL_ENDS
-    Logic: Parse CSV, Convert to Binary Struct [RFID][START][END], 
-           Merge with existing blob for Today, Update DB.
+    CSV Format: STARTING_DATE, ENDING_DATE, STARTING_TIME, ENDING_TIME, RFID
     """
     password = request.form.get('password')
     if password != PASSWORD:
@@ -222,81 +269,25 @@ def submit_permissions():
     if not file:
         return "No file uploaded", 400
         
-    # Read CSV content
     try:
         content = file.read().decode('utf-8').strip().split('\n')
     except Exception as e:
         return f"Error reading file: {e}", 400
 
-    new_records = {} # Map RFID -> (Start, End)
-
-    for line in content:
-        line = line.strip()
-        if not line or line.lower().startswith('rfid'): continue # Skip empty or header
-        
-        parts = line.split(',')
-        if len(parts) >= 3:
-            try:
-                rfid = int(parts[0].strip())
-                
-                # Check if it's integer (Unix Timestamp) or String (Datetime)
-                s_str = parts[1].strip()
-                e_str = parts[2].strip()
-                
-                try:
-                    start = int(s_str)
-                    end = int(e_str)
-                except ValueError:
-                    # Try Parsing Datetime String
-                    fmt = "%Y-%m-%d %H:%M:%S"
-                    start = int(datetime.strptime(s_str, fmt).timestamp())
-                    end = int(datetime.strptime(e_str, fmt).timestamp())
-
-                new_records[rfid] = (start, end)
-            except ValueError:
-                continue
-
-    # Fetch existing data for TODAY
-    today_str = date.today().isoformat() # YYYY-MM-DD
     conn = get_db_connection()
-    existing_blob = None
+    inserted = 0
     try:
-        row = conn.execute('SELECT PERMISSIONS FROM PERMISSION_LIST WHERE DATE_TIME = ?', (today_str,)).fetchone()
-        if row:
-            existing_blob = row['PERMISSIONS']
-    except Exception as e:
-        print(f"DB Read Error: {e}")
-        
-    # Merge Logic
-    final_records = {}
-    
-    # Parse existing blob if any
-    if existing_blob:
-        # BLOB Format: [RFID(4)][START(4)][END(4)] ...
-        # No header in the BLOB stored in DB? Plan says "Binary Protocol Change" for *Response*.
-        # Storing just records in DB is cleaner.
-        chunk_size = 12
-        for i in range(0, len(existing_blob), chunk_size):
-            chunk = existing_blob[i:i+chunk_size]
-            if len(chunk) == chunk_size:
-                r_id, r_start, r_end = struct.unpack('<III', chunk)
-                final_records[r_id] = (r_start, r_end)
-    
-    # Update with new records (Overwrite existing)
-    final_records.update(new_records)
-    
-    # Pack back to Blob
-    packed_data = bytearray()
-    for r_id, (r_start, r_end) in final_records.items():
-        packed_data.extend(struct.pack('<III', r_id, r_start, r_end))
-        
-    # Save to DB
-    try:
-        conn.execute('''
-            INSERT INTO PERMISSION_LIST (DATE_TIME, PERMISSIONS) 
-            VALUES (?, ?)
-            ON CONFLICT(DATE_TIME) DO UPDATE SET PERMISSIONS=excluded.PERMISSIONS
-        ''', (today_str, packed_data))
+        for line in content:
+            line = line.strip()
+            if not line or line.lower().startswith('start'): continue
+            
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 5:
+                conn.execute('''
+                    INSERT INTO PERMISSION_LIST (STARTING_DATE, ENDING_DATE, STARTING_TIME, ENDING_TIME, RFID)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (parts[0], parts[1], parts[2], parts[3], parts[4]))
+                inserted += 1
         conn.commit()
     except Exception as e:
         conn.close()
@@ -304,30 +295,48 @@ def submit_permissions():
         
     conn.close()
     broadcast_payload()  # Push update to ESP32s
-    return f"Success. Total records for {today_str}: {len(final_records)}", 200
+    return f"Success. Inserted {inserted} records.", 200
 
 @app.route('/restrictedTimeDeclearation', methods=['POST'])
 def set_restricted_time():
     """
-    Form: 'restricted_time_start', 'restricted_time_ends' (Unix Timestamps)
+    Form: 'date' (YYYY-MM-DD)
+    Form: 'free_times' (JSON Array String of Normal Timestamps: ["2026-04-30 08:00:00", "2026-04-30 12:00:00"])
     """
     password = request.form.get('password')
     if password != PASSWORD:
         return "Unauthorized", 401
         
     try:
-        start = request.form.get('restricted_time_start')
-        end = request.form.get('restricted_time_ends')
-        
+        free_times_str = request.form.get('free_times', '[]')
+        free_times_raw = json.loads(free_times_str)
+        if not isinstance(free_times_raw, list) or len(free_times_raw) % 2 != 0:
+            return "Invalid free_times format. Must be an array of even length.", 400
+            
+        # Convert "YYYY-MM-DD HH:MM:SS" to unix timestamps
+        free_times_unix = []
+        fmt = "%Y-%m-%d %H:%M:%S"
+        for t_str in free_times_raw:
+            dt = datetime.strptime(str(t_str).strip(), fmt)
+            free_times_unix.append(int(dt.timestamp()))
+            
+        today_str = request.form.get("date")
+        if not today_str:
+            today_str = date.today().isoformat()
+            
+        final_free_times_str = json.dumps(free_times_unix)
+
         conn = get_db_connection()
-        conn.execute('INSERT INTO RESTRICTED_PERIOD (DATE_TIME_OF_START, DATE_TIME_OF_END) VALUES (?, ?)',
-                     (start, end))
+        conn.execute('INSERT INTO FREE_TIME_LOG (CONFIG_DATE, TIME_LIST) VALUES (?, ?)',
+                     (today_str, final_free_times_str))
         conn.commit()
         conn.close()
         broadcast_payload()  # Push update to ESP32s
-        return "Restricted Period Set", 200
-    except ValueError:
-        return "Invalid integers", 400
+        return "Free Time Configured", 200
+    except json.JSONDecodeError:
+        return "Invalid JSON in free_times", 400
+    except ValueError as e:
+        return f"Invalid time format, expected YYYY-MM-DD HH:MM:SS. Error: {e}", 400
     except Exception as e:
         return f"DB Error: {e}", 500
 
