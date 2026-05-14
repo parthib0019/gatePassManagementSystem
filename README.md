@@ -1,35 +1,33 @@
-# Gate Pass Management System
+# Gate Pass Management System V2
 
-A dual-core ESP32-based access control system featuring offline caching, real-time server synchronization, and dual NFC reader support for tracking student entry and exit.
+An intelligent ESP32-based access control system featuring real-time WebSocket synchronization, smart state-based entry/exit tracking, and discontinuous time slot scheduling for students.
 
 ## Features
 
-- **Dual NFC Readers**: 
-  - **Reader 1 (Exit)**: Checks permissions against a local database (synced from server). Logs exits (State `0`).
-  - **Reader 2 (Entry)**: Logs all entries (State `1`).
-- **Offline Capability**: Caches access logs locally on the ESP32 when WiFi is unavailable.
-- **Real-time Sync**: Automatically uploads cached logs to the server every **1 second**.
-- **Server UI/API**: 
-  - Upload permission lists via CSV.
-  - Set restricted time periods.
-  - Download tracking logs as CSV (with date filtering).
-- **Status Indicators**: Visual feedback via Green and Red LEDs.
+- **Smart Single NFC Reader**: 
+  - A single PN532 scanner intelligently handles both entries and exits.
+  - Checks the local `out_Stu` cache: If the student is already outside, tapping the card grants entry (State `1`). If they are inside, it validates rules before granting exit (State `0`).
+- **Discontinuous Free Time Slots**: Authority can configure multiple discontinuous free time blocks for a given day.
+- **Granular Student Permissions**: Individual students can be granted multiple, discontinuous gate pass time slots on the same day.
+- **Real-time Synchronization**: Uses WebSockets to instantly push configuration changes, permission updates, and the list of currently absent students to the ESP32.
+- **Power-Loss Recovery**: The server maintains an `OUT_STUDENTS` database table and syncs it to the ESP32 upon connection, ensuring the system remembers who is outside even after a power failure.
+- **Visual & Audio Feedback**: Uses an Adafruit NeoPixel Matrix and a buzzer for clear feedback (Green = Exit, Blue = Entry, Red = Denied).
 
 ## Hardware Requirements
 
 - **Microcontroller**: ESP32 Development Board
-- **NFC Readers**: 2x PN532 Modules (SPI Interface)
+- **NFC Reader**: 1x PN532 Module (SPI Interface)
 - **Indicators**: 
-  - Green LED (Access Granted)
-  - Red LED (Access Denied)
+  - Adafruit NeoPixel Matrix (16 pixels)
+  - Active Buzzer
 - **Wiring**:
 
 | Component | ESP32 Pin | Note |
-|Data (Both)| SCK(18), MISO(19), MOSI(23) | Shared SPI Bus |
-| Reader 1 (Exit) | GPIO 5 | Chip Select (SS) |
-| Reader 2 (Entry)| GPIO 22 | Chip Select (SS) |
-| Green LED | GPIO 21 | Active High |
-| Red LED | GPIO 4 | Active High |
+|---|---|---|
+| PN532 Data | SCK(18), MISO(19), MOSI(23) | SPI Bus |
+| PN532 Chip Select | GPIO 5 | SS |
+| NeoPixel Matrix | GPIO 14 | DIN |
+| Buzzer | GPIO 21 | Active High |
 
 ## Software Setup
 
@@ -37,7 +35,7 @@ A dual-core ESP32-based access control system featuring offline caching, real-ti
 1.  **Prerequisites**: Python 3.x, `pip`.
 2.  **Installation**:
     ```bash
-    pip install flask
+    pip install flask flask-sock
     ```
 3.  **Run Server**:
     ```bash
@@ -48,45 +46,59 @@ A dual-core ESP32-based access control system featuring offline caching, real-ti
 ### Firmware (ESP32)
 1.  **IDE**: Arduino IDE or PlatformIO.
 2.  **Libraries**:
-    -   `PN532` (Adafruit or similar SPI-compatible library)
-    -   `HTTPClient`
-    -   `WiFi`
+    -   `Adafruit_PN532`
+    -   `Adafruit_NeoPixel`
+    -   `WebSockets`
 3.  **Configuration**:
     -   Open `esp32_gatepass/esp32_gatepass.ino`.
     -   Update `ssid` and `password` with your WiFi credentials.
-    -   Update `serverUrl` (e.g., your ngrok URL or local IP).
+    -   Update `wsHost` and `timeServerUrl` with your server's domain/IP.
 
 ## API Endpoints
 
-### 1. Sync & Tracking
--   **Endpoint**: `/permitted_students`
--   **Method**: `POST`
--   **Description**: Receives tracking logs from ESP32 and returns updated permission list.
--   **Payload**: `{"tracking": [{"uid": 123, "ts": 170..., "state": 1}]}`
-
-### 2. Export Logs
--   **Endpoint**: `/get_tracker_csv`
--   **Method**: `POST`
--   **Parameters**:
-    -   `password`: Server password (Default: `GatePassSecurity`)
-    -   `date` (Optional): Filter by date (Format: `YYYY-MM-DD`)
--   **Example**:
-    ```bash
-    curl -X POST -d "password=GatePassSecurity" -d "date=2026-02-10" http://localhost:5000/get_tracker_csv -o logs.csv
-    ```
-
-### 3. Upload Permissions
+### 1. Upload Permissions (CSV)
 -   **Endpoint**: `/PermitedPDFSubmission`
 -   **Method**: `POST`
--   **Parameters**: `password`, `file` (CSV with headers `RFID, START, END`)
+-   **Parameters**: `password`, `file`
+-   **CSV Format**: `STARTING_DATE, ENDING_DATE, STARTING_TIME, ENDING_TIME, RFID`
+-   **Description**: Uploads student-specific gate passes. Overlapping intervals for the same student are fully supported.
 
-### 4. Set Restricted Time
+### 2. Set Free Time Slots
 -   **Endpoint**: `/restrictedTimeDeclearation`
 -   **Method**: `POST`
--   **Parameters**: `password`, `restricted_time_start`, `restricted_time_ends` (Unix Timestamps)
+-   **Parameters**: 
+    - `password`: Server password
+    - `date`: Format `YYYY-MM-DD`
+    - `free_times`: JSON array of datetime strings (e.g., `["2026-05-01 07:19:00", "2026-05-01 07:30:00"]`)
 
-## Database
-SQLite database is stored at `additionals/database.db`.
--   **Student_tracker**: Stores all entry/exit events.
--   **PERMISSION_LIST**: Stores authorized student IDs and time slots.
--   **RESTRICTED_PERIOD**: Stores global lockdown times.
+### 3. Download Today's Permissions
+-   **Endpoint**: `/todayList`
+-   **Method**: `GET`
+-   **Description**: Downloads a CSV of all active permission slots for the current day.
+
+### 4. Export Tracking Logs
+-   **Endpoint**: `/get_tracker_csv`
+-   **Method**: `POST`
+-   **Parameters**: `password`, `date` (Optional)
+
+## Database Schema (`additionals/database.db`)
+
+The SQLite database is auto-initialized by the server.
+-   **Student_tracker**: Stores all entry (1) and exit (0) events with timestamps.
+-   **PERMISSION_LIST**: Stores individual student gate pass intervals (`STARTING_DATE`, `ENDING_DATE`, `STARTING_TIME`, `ENDING_TIME`, `RFID`).
+-   **FREE_TIME_LOG**: Chronological log of global free time configurations.
+-   **OUT_STUDENTS**: Real-time table storing the RFIDs of all students currently outside the campus.
+
+
+## curl command to change the free time:
+curl -X POST \
+  -d "password=GatePassSecurity" \
+  -d "date=2026-05-01" \
+  -d 'free_times=["2026-05-01 07:39:00", "2026-05-01 07:40:00","2026-05-01 09:40:00","2026-05-01 10:55:00"]' \
+  https://nonmetalliferous-callen-anciently.ngrok-free.dev/restrictedTimeDeclearation
+
+## curl commant to upload the permission list:
+curl -X POST -F "password=GatePassSecurity" -F "file=@test.csv" https://nonmetalliferous-callen-anciently.ngrok-free.dev/PermitedPDFSubmission
+
+## curl commant to download the tracking log:
+curl -X POST -d "password=GatePassSecurity" -d "date=2026-05-01" https://nonmetalliferous-callen-anciently.ngrok-free.dev/get_tracker_csv -o logs.csv
