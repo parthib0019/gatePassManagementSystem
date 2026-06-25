@@ -34,13 +34,14 @@ def init_db():
     try:
         conn.execute('''
             CREATE TABLE IF NOT EXISTS PERMISSION_LIST (
-                ID INTEGER PRIMARY KEY AUTOINCREMENT,
-                STARTING_DATE TEXT NOT NULL,
-                ENDING_DATE TEXT NOT NULL,
-                STARTING_TIME TEXT NOT NULL,
-                ENDING_TIME TEXT NOT NULL,
-                RFID TEXT NOT NULL
-            );
+                ID INTEGER PRIMARY KEY AUTOINCREMENT, 
+                STARTING_DATE TEXT NOT NULL, 
+                ENDING_DATE TEXT NOT NULL, 
+                STARTING_TIME TEXT NOT NULL, 
+                ENDING_TIME NOT NULL, 
+                RFID TEXT NOT NULL, 
+                STATUS TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(STATUS IN ('ACTIVE', 'EXPIRED', 'DEACTIVE')), 
+                TYPE TEXT NOT NULL DEFAULT 'ONETIME' CHECK(TYPE IN('ONETIME', 'MONTHLY')));
         ''')
         
         conn.execute('''
@@ -51,11 +52,11 @@ def init_db():
         
         # Table for Free Time Slots Configuration
         conn.execute('''
-            CREATE TABLE IF NOT EXISTS FREE_TIME_LOG (
+            CREATE TABLE FREE_TIME_LOG (
                 ID INTEGER PRIMARY KEY AUTOINCREMENT,
                 CONFIG_DATE DATE NOT NULL,
-                TIME_LIST TEXT NOT NULL
-            );
+                TIME_LIST TEXT NOT NULL, 
+                TYPE CHAR(1));
         ''')
         
         # Table for Student Tracking (Entry/Exit)
@@ -150,8 +151,28 @@ def Permitted_List_genarater():
 
 def get_current_binary_payload():
     """Returns the Header + BLOB representing current free times and daily permissions"""
+    today = date.today().isoformat()
     conn = get_db_connection()
-    row = conn.execute('SELECT * FROM FREE_TIME_LOG ORDER BY ID DESC LIMIT 1').fetchone()
+    row = conn.execute('SELECT * FROM FREE_TIME_LOG WHERE CONFIG_DATE = ? ORDER BY ID DESC LIMIT 1', (today,)).fetchone()
+    
+    if not row:
+        default_row = conn.execute("SELECT * FROM FREE_TIME_LOG WHERE TYPE = 'D' ORDER BY ID DESC LIMIT 1").fetchone()
+        if default_row and default_row['TIME_LIST']:
+            try:
+                default_times = json.loads(default_row['TIME_LIST'])
+                today_dt = date.today()
+                modified_times = []
+                for ts in default_times:
+                    dt = datetime.fromtimestamp(ts)
+                    new_dt = dt.replace(year=today_dt.year, month=today_dt.month, day=today_dt.day)
+                    modified_times.append(int(new_dt.timestamp()))
+                
+                new_time_list = json.dumps(modified_times)
+                cursor = conn.execute("INSERT INTO FREE_TIME_LOG (CONFIG_DATE, TIME_LIST, TYPE) VALUES (?, ?, ?)", (today, new_time_list, 'D'))
+                conn.commit()
+                row = conn.execute("SELECT * FROM FREE_TIME_LOG WHERE CONFIG_DATE = ? ORDER BY ID DESC LIMIT 1", (today,)).fetchone()
+            except Exception as e:
+                print(f"Error processing default TIME_LIST: {e}")
     
     free_times = []
     if row and row['TIME_LIST']:
@@ -334,6 +355,7 @@ def set_restricted_time():
     try:
         free_times_str = request.form.get('free_times', '[]')
         free_times_raw = json.loads(free_times_str)
+        type = request.form.get('type', 'T');
         if not isinstance(free_times_raw, list) or len(free_times_raw) % 2 != 0:
             return "Invalid free_times format. Must be an array of even length.", 400
             
@@ -351,8 +373,10 @@ def set_restricted_time():
         final_free_times_str = json.dumps(free_times_unix)
 
         conn = get_db_connection()
-        conn.execute('INSERT INTO FREE_TIME_LOG (CONFIG_DATE, TIME_LIST) VALUES (?, ?)',
-                     (today_str, final_free_times_str))
+        if type == 'T':
+            conn.execute('INSERT INTO FREE_TIME_LOG (CONFIG_DATE, TIME_LIST, TYPE) VALUES (?, ?, ?)',(today_str, final_free_times_str, 'T'))
+        else:
+            conn.execute('INSERT INTO FREE_TIME_LOG (CONFIG_DATE, TIME_LIST, TYPE) VALUES (?, ?, ?)',(today_str, final_free_times_str, 'D'))
         conn.commit()
         conn.close()
         broadcast_payload()  # Push update to ESP32s

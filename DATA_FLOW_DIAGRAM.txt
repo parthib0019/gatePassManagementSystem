@@ -1,0 +1,98 @@
+=========================================================
+          GATE PASS SYSTEM DATA FLOW DIAGRAM
+=========================================================
+
+This document illustrates the simplified workflow of the 
+Gate Pass Management System, showing the journey of data 
+from a student tapping their card to the server storage.
+
+---------------------------------------------------------
+1. THE HARDWARE LEVEL (ESP32 Gates)
+---------------------------------------------------------
+[ Student Taps RFID Card ]
+         |
+         v
+  ( Is it Entry or Exit? )
+         |
+    +----+----+
+    |         |
+ [Entry]    [Exit]
+    |         |
+    |         v
+    |   [ Check Local Permission Cache ]
+    |         |
+    |      +--+--+
+    |      |     |
+    |   [Yes]   [No] -----> [ Deny Exit / Red LED ]
+    |      |
+    +------+
+         |
+         v
+ [ Grant Access / Green LED ]
+         |
+         v
+ [ Save Log to Local RAM Cache ]
+
+
+---------------------------------------------------------
+2. THE SYNCHRONIZATION LOOP (Runs every 1 second)
+---------------------------------------------------------
+ [ Local RAM Cache ] 
+         |
+         | (Background Sync Task via WiFi)
+         v
+ [ HTTP / WebSocket Sync ]  <----> [ Python Web Server ]
+
+
+---------------------------------------------------------
+3. THE BACKEND LEVEL (Python Server & Database)
+---------------------------------------------------------
+          [ Python Web Server ]
+                  |
+        +---------+---------+
+        |                   |
+        v                   v
+ [ Save Logs ]       [ Fetch Latest Permissions ]
+ [ to SQLite ]       [ & Free Times             ]
+        |                   |
+        +---------+---------+
+                  |
+                  v
+          [ SQLite Database ]
+
+
+---------------------------------------------------------
+4. THE REAL-TIME RESPONSE (Back to Hardware)
+---------------------------------------------------------
+ [ Python Web Server ]
+         |
+         | (Packs data into Compressed Binary Blob)
+         v
+ [ Sends Response to ESP32 ]
+         |
+         v
+ [ Updates ESP32 Local Cache with new Permissions ]
+
+
+---------------------------------------------------------
+5. ADMINISTRATOR ACTIONS
+---------------------------------------------------------
+ [ Administrator ]
+         |
+    +----+----+
+    |         |
+    v         v
+ [ Upload    [ Configure 
+   CSV ]       Free Time ]
+    |         |
+    +----+----+
+         |
+         v
+ [ Python Web Server ]
+         |
+         v
+ [ SQLite Database ]
+         |
+ (Automatically synced to ESP32s on their next 1s pulse)
+
+=========================================================

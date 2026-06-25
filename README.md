@@ -92,13 +92,14 @@ The SQLite database is auto-initialized by the server.
 
 ## curl command to change the free time:
 curl -X POST \
-  -d "password=GatePassSecurity" \
+  -d "password=YOUR_PASSWORD_HERE" \
   -d "date=2026-05-01" \
   -d 'free_times=["2026-05-01 07:39:00", "2026-05-01 07:40:00","2026-05-01 09:40:00","2026-05-01 10:55:00"]' \
+  -d "type=T" \
   https://nonmetalliferous-callen-anciently.ngrok-free.dev/restrictedTimeDeclearation
 
 ## curl commant to upload the permission list:
-curl -X POST -F "password=GatePassSecurity" -F "file=@test.csv" https://nonmetalliferous-callen-anciently.ngrok-free.dev/PermitedPDFSubmission
+curl -X POST -F "password=YOUR_PASSWORD_HERE" -F "file=@test.csv" https://nonmetalliferous-callen-anciently.ngrok-free.dev/PermitedPDFSubmission
 
 ## curl commant to download the tracking log:
-curl -X POST -d "password=GatePassSecurity" -d "date=2026-05-01" https://nonmetalliferous-callen-anciently.ngrok-free.dev/get_tracker_csv -o logs.csv
+curl -X POST -d "password=YOUR_PASSWORD_HERE" -d "date=2026-05-01" https://nonmetalliferous-callen-anciently.ngrok-free.dev/get_tracker_csv -o logs.csv
